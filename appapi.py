@@ -48,6 +48,7 @@ def load_depth_data_from_api(session_id):
 
         all_rows = []
         BATCH_SIZE = 100
+        # Spinner is helpful for the initial, potentially large, load
         with st.spinner(f"Fetching {len(timestamps)} snapshots..."):
             for i in range(0, len(timestamps), BATCH_SIZE):
                 batch_timestamps = timestamps[i:i + BATCH_SIZE]
@@ -113,8 +114,17 @@ st_autorefresh(interval=5000, key="data_refresher")
 st.sidebar.header("1. Select Session")
 sessions = fetch_available_sessions()
 session_names = [s.get('name', s.get('id')) for s in sessions]
-selected_session_name = st.sidebar.selectbox("Choose a session", options=session_names)
-selected_session_id = next((s.get('id') for s in sessions if s.get('name', s.get('id')) == selected_session_name), None)
+
+# --- MODIFIED: Add a placeholder to prevent auto-loading ---
+placeholder = "--- Select a session ---"
+options = [placeholder] + session_names
+selected_session_name = st.sidebar.selectbox("Choose a session", options=options)
+
+selected_session_id = None
+# Only find an ID if the user has selected a real session
+if selected_session_name != placeholder:
+    selected_session_id = next((s.get('id') for s in sessions if s.get('name', s.get('id')) == selected_session_name), None)
+
 
 st.sidebar.header("2. Upload Sales File (Optional)")
 uploaded_sales_file = st.sidebar.file_uploader("Upload Course of Sales CSV", type="csv")
@@ -131,11 +141,10 @@ if selected_session_id:
     if depth_df is not None and not depth_df.empty:
         trade_date = depth_df['datetime'].iloc[0].date()
         
-        # --- NEW: Conditional Data Processing & UI ---
         mid_point_df = calculate_mid_point(depth_df)
         sales_df = process_sales_data(uploaded_sales_file, trade_date)
         
-        price_line_source = "Calculated Mid-Point" # Default source
+        price_line_source = "Calculated Mid-Point"
         if sales_df is not None and not sales_df.empty:
             price_line_source = st.sidebar.radio(
                 "Price Line Source",
@@ -143,14 +152,12 @@ if selected_session_id:
                 index=0
             )
 
-        # --- Filter Data to Trading Session ---
         trade_date_str = trade_date.strftime('%Y-%m-%d')
         SESSION_START = pd.to_datetime(f"{trade_date_str} 10:00:00").tz_localize('Australia/Melbourne')
         SESSION_END = pd.to_datetime(f"{trade_date_str} 16:00:00").tz_localize('Australia/Melbourne')
         
         depth_df = depth_df[(depth_df['datetime'] >= SESSION_START) & (depth_df['datetime'] < SESSION_END)]
         
-        # Determine which price data to use for the line and axis range
         if price_line_source == "Actual Traded Price" and sales_df is not None:
             price_df = sales_df[(sales_df['datetime'] >= SESSION_START) & (sales_df['datetime'] < SESSION_END)]
             price_line_data = {'x': price_df['datetime'], 'y': price_df['Price'], 'name': 'Trade Price', 'dash': 'solid'}
@@ -168,7 +175,6 @@ if selected_session_id:
             last_update_time = depth_df['datetime'].max().strftime('%H:%M:%S')
             st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time})")
 
-            # --- Prepare Heatmap ---
             depth_df['SignedVolume'] = np.where(depth_df['Type'] == 'BUY', depth_df['Volume'], -depth_df['Volume'])
             heatmap_pivot = depth_df.pivot_table(index='Price', columns='datetime', values='SignedVolume', aggfunc='sum').fillna(0)
             
@@ -177,7 +183,6 @@ if selected_session_id:
             price_bins = np.arange(np.floor(min_price), np.ceil(max_price) + bin_size, bin_size)
             binned_heatmap = heatmap_pivot.groupby(pd.cut(heatmap_pivot.index, bins=price_bins, right=False), observed=False).sum()
 
-            # --- Create Plotly Figure ---
             fig = go.Figure()
             non_zero_values = binned_heatmap.values[binned_heatmap.values != 0]
             clip_level = np.percentile(np.abs(non_zero_values), 95) if non_zero_values.size > 0 else 1
