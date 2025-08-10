@@ -114,17 +114,13 @@ st_autorefresh(interval=5000, key="data_refresher")
 st.sidebar.header("1. Select Session")
 sessions = fetch_available_sessions()
 session_names = [s.get('name', s.get('id')) for s in sessions]
-
-# --- MODIFIED: Add a placeholder to prevent auto-loading ---
 placeholder = "--- Select a session ---"
 options = [placeholder] + session_names
 selected_session_name = st.sidebar.selectbox("Choose a session", options=options)
 
 selected_session_id = None
-# Only find an ID if the user has selected a real session
 if selected_session_name != placeholder:
     selected_session_id = next((s.get('id') for s in sessions if s.get('name', s.get('id')) == selected_session_name), None)
-
 
 st.sidebar.header("2. Upload Sales File (Optional)")
 uploaded_sales_file = st.sidebar.file_uploader("Upload Course of Sales CSV", type="csv")
@@ -135,13 +131,15 @@ bin_size = st.sidebar.number_input(
 )
 
 # --- 5. Main Application Logic ---
-if selected_session_id:
-    depth_df = load_depth_data_from_api(selected_session_id)
+if not selected_session_id:
+    st.info("👋 Welcome! Please select a session to begin streaming.")
+else:
+    depth_df_raw = load_depth_data_from_api(selected_session_id)
 
-    if depth_df is not None and not depth_df.empty:
-        trade_date = depth_df['datetime'].iloc[0].date()
+    if depth_df_raw is not None and not depth_df_raw.empty:
+        trade_date = depth_df_raw['datetime'].iloc[0].date()
         
-        mid_point_df = calculate_mid_point(depth_df)
+        mid_point_df = calculate_mid_point(depth_df_raw)
         sales_df = process_sales_data(uploaded_sales_file, trade_date)
         
         price_line_source = "Calculated Mid-Point"
@@ -156,7 +154,7 @@ if selected_session_id:
         SESSION_START = pd.to_datetime(f"{trade_date_str} 10:00:00").tz_localize('Australia/Melbourne')
         SESSION_END = pd.to_datetime(f"{trade_date_str} 16:00:00").tz_localize('Australia/Melbourne')
         
-        depth_df = depth_df[(depth_df['datetime'] >= SESSION_START) & (depth_df['datetime'] < SESSION_END)]
+        depth_df = depth_df_raw[(depth_df_raw['datetime'] >= SESSION_START) & (depth_df_raw['datetime'] < SESSION_END)]
         
         if price_line_source == "Actual Traded Price" and sales_df is not None:
             price_df = sales_df[(sales_df['datetime'] >= SESSION_START) & (sales_df['datetime'] < SESSION_END)]
@@ -169,12 +167,14 @@ if selected_session_id:
             custom_data = None
             hover_template = '<b>Time:</b> %{x|%H:%M:%S}<br><b>Mid-Point:</b> $%{y:.3f}<extra></extra>'
 
+        last_update_time = depth_df_raw['datetime'].max().strftime('%H:%M:%S')
+        st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time})")
+        
+        # --- CORRECTED: Check for empty dataframes *before* doing calculations ---
         if depth_df.empty or price_df.empty:
             st.warning("Waiting for data within the main trading session (10:00 AM - 4:00 PM)...")
         else:
-            last_update_time = depth_df['datetime'].max().strftime('%H:%M:%S')
-            st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time})")
-
+            # --- Prepare Heatmap ---
             depth_df['SignedVolume'] = np.where(depth_df['Type'] == 'BUY', depth_df['Volume'], -depth_df['Volume'])
             heatmap_pivot = depth_df.pivot_table(index='Price', columns='datetime', values='SignedVolume', aggfunc='sum').fillna(0)
             
@@ -183,6 +183,7 @@ if selected_session_id:
             price_bins = np.arange(np.floor(min_price), np.ceil(max_price) + bin_size, bin_size)
             binned_heatmap = heatmap_pivot.groupby(pd.cut(heatmap_pivot.index, bins=price_bins, right=False), observed=False).sum()
 
+            # --- Create Plotly Figure ---
             fig = go.Figure()
             non_zero_values = binned_heatmap.values[binned_heatmap.values != 0]
             clip_level = np.percentile(np.abs(non_zero_values), 95) if non_zero_values.size > 0 else 1
@@ -202,6 +203,3 @@ if selected_session_id:
             
             fig.update_layout(height=650, title_text='Market Heatmap with Price Overlay', yaxis_title='Price Level')
             st.plotly_chart(fig, use_container_width=True)
-
-else:
-    st.info("👋 Welcome! Please select a session to begin streaming.")
