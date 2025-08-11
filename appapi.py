@@ -32,49 +32,55 @@ def fetch_available_sessions():
         st.error(f"API Error: Could not fetch sessions. {e}")
         return []
 
-@st.spinner(text="Fetching market depth data...")
-def load_depth_data_from_api(session_id):
-    """Fetches and processes live market depth data from the API."""
-    # This function remains largely the same, but it's now only called for the live session
-    # ... (The rest of this function is the same as the previous version) ...
-    if not session_id: return None
+def get_snapshots(session_id, timestamps):
+    """Helper function to fetch a batch of snapshots."""
+    if not timestamps:
+        return []
+    timestamps_str = ",".join(map(str, timestamps))
+    snapshot_url = f"{API_URLS['GET_SNAPSHOTS']}?id={session_id}&timestamps={timestamps_str}"
+    response = requests.get(snapshot_url)
+    if response.ok:
+        return response.json()
+    return []
+
+def parse_rows(batch_data):
+    """Helper function to parse JSON data into a list of dicts."""
+    all_rows = []
+    for snapshot in batch_data:
+        dt = pd.to_datetime(snapshot.get('timestamp'), unit='ms')
+        for order in snapshot.get('bids', []):
+            all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size')})
+        for order in snapshot.get('asks', []):
+            all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size')})
+    return all_rows
+
+def update_live_data(session_id):
+    """Fetches only new data since the last update."""
     try:
         details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
         details_response = requests.get(details_url)
         details_response.raise_for_status()
-        timestamps = details_response.json().get('timestamps', [])
-        if not timestamps:
-            st.warning(f"No timestamps found for session: {session_id}")
-            return None
+        all_timestamps = details_response.json().get('timestamps', [])
+        
+        last_timestamp = st.session_state.get('last_timestamp', 0)
+        
+        new_timestamps = [ts for ts in all_timestamps if ts > last_timestamp]
 
-        all_rows = []
-        BATCH_SIZE = 100
-        for i in range(0, len(timestamps), BATCH_SIZE):
-            batch_timestamps = timestamps[i:i + BATCH_SIZE]
-            timestamps_str = ",".join(map(str, batch_timestamps))
-            snapshot_url = f"{API_URLS['GET_SNAPSHOTS']}?id={session_id}&timestamps={timestamps_str}"
-            snapshot_response = requests.get(snapshot_url)
-            if snapshot_response.ok:
-                for snapshot in snapshot_response.json():
-                    dt = pd.to_datetime(snapshot.get('timestamp'), unit='ms')
-                    for order in snapshot.get('bids', []):
-                        all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size')})
-                    for order in snapshot.get('asks', []):
-                        all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size')})
-        if not all_rows:
-            st.warning("API returned no valid depth data.")
-            return None
+        if new_timestamps:
+            new_rows = parse_rows(get_snapshots(session_id, new_timestamps))
+            if new_rows:
+                new_df = pd.DataFrame(new_rows)
+                # Combine with existing data in session state
+                if st.session_state.depth_df_raw is not None:
+                    st.session_state.depth_df_raw = pd.concat([st.session_state.depth_df_raw, new_df]).drop_duplicates()
+                else:
+                    st.session_state.depth_df_raw = new_df
+                
+                # Update the last timestamp
+                st.session_state.last_timestamp = max(new_timestamps)
 
-        depth_df = pd.DataFrame(all_rows)
-        depth_df.dropna(inplace=True)
-        for col in ['Price', 'Volume']:
-            depth_df[col] = pd.to_numeric(depth_df[col])
-        depth_df['datetime'] = depth_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
-        depth_df.sort_values('datetime', inplace=True)
-        return depth_df
     except requests.exceptions.RequestException as e:
-        st.error(f"API Error: Could not load session data. {e}")
-        return None
+        st.error(f"API Error during update: {e}")
 
 def calculate_mid_point(df):
     """Calculates the mid-point for each timestamp in a vectorized way."""
@@ -88,12 +94,16 @@ def calculate_mid_point(df):
 st.sidebar.title("Controls")
 st.sidebar.header("1. Live Session")
 
-# Initialize session state to manage the live mode
 if 'live_mode_on' not in st.session_state:
     st.session_state.live_mode_on = False
+    st.session_state.depth_df_raw = None
+    st.session_state.last_timestamp = 0
 
 if st.sidebar.button("▶️ Start Live Session"):
     st.session_state.live_mode_on = True
+    # Reset data when starting a new session
+    st.session_state.depth_df_raw = None
+    st.session_state.last_timestamp = 0
 
 if st.sidebar.button("⏹️ Stop Live Session"):
     st.session_state.live_mode_on = False
@@ -107,27 +117,26 @@ bin_size = st.sidebar.number_input(
 if not st.session_state.live_mode_on:
     st.info("👋 Welcome! Click 'Start Live Session' in the sidebar to begin.")
 else:
-    # Activate auto-refresh ONLY when in live mode
     st_autorefresh(interval=5000, key="data_refresher")
 
-    # --- Find Today's Session ---
     sessions = fetch_available_sessions()
     au_tz = pytz.timezone('Australia/Melbourne')
     today_str = datetime.now(au_tz).strftime('%Y%m%d')
     
-    todays_session_id = None
-    for session in sessions:
-        # Assuming session ID starts with the date string 'YYYYMMDD'
-        if session.get('id', '').startswith(today_str):
-            todays_session_id = session['id']
-            break
+    todays_session_id = next((s['id'] for s in sessions if s.get('id', '').startswith(today_str)), None)
     
     if not todays_session_id:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
-        depth_df_raw = load_depth_data_from_api(todays_session_id)
+        # Update data incrementally
+        update_live_data(todays_session_id)
+        
+        depth_df_raw = st.session_state.get('depth_df_raw')
 
-        if depth_df_raw is not None and not depth_df_raw.empty:
+        if depth_df_raw is None or depth_df_raw.empty:
+            st.warning("Waiting for the first data snapshot...")
+        else:
+            # All processing now happens on the potentially large but stable dataframe
             trade_date = depth_df_raw['datetime'].iloc[0].date()
             price_df = calculate_mid_point(depth_df_raw)
 
@@ -143,7 +152,6 @@ else:
             if depth_df.empty or price_df.empty:
                 st.warning("Waiting for data within the main trading session (10:00 AM - 4:00 PM)...")
             else:
-                # --- Prepare and Display Chart ---
                 depth_df['SignedVolume'] = np.where(depth_df['Type'] == 'BUY', depth_df['Volume'], -depth_df['Volume'])
                 min_price = price_df['mid_point'].min() - 0.50
                 max_price = price_df['mid_point'].max() + 0.50
