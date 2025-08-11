@@ -34,8 +34,7 @@ def fetch_available_sessions():
 
 def get_snapshots(session_id, timestamps):
     """Helper function to fetch a batch of snapshots."""
-    if not timestamps:
-        return []
+    if not timestamps: return []
     timestamps_str = ",".join(map(str, timestamps))
     snapshot_url = f"{API_URLS['GET_SNAPSHOTS']}?id={session_id}&timestamps={timestamps_str}"
     response = requests.get(snapshot_url)
@@ -63,22 +62,17 @@ def update_live_data(session_id):
         all_timestamps = details_response.json().get('timestamps', [])
         
         last_timestamp = st.session_state.get('last_timestamp', 0)
-        
         new_timestamps = [ts for ts in all_timestamps if ts > last_timestamp]
 
         if new_timestamps:
             new_rows = parse_rows(get_snapshots(session_id, new_timestamps))
             if new_rows:
                 new_df = pd.DataFrame(new_rows)
-                # Combine with existing data in session state
                 if st.session_state.depth_df_raw is not None:
                     st.session_state.depth_df_raw = pd.concat([st.session_state.depth_df_raw, new_df]).drop_duplicates()
                 else:
                     st.session_state.depth_df_raw = new_df
-                
-                # Update the last timestamp
                 st.session_state.last_timestamp = max(new_timestamps)
-
     except requests.exceptions.RequestException as e:
         st.error(f"API Error during update: {e}")
 
@@ -101,12 +95,13 @@ if 'live_mode_on' not in st.session_state:
 
 if st.sidebar.button("▶️ Start Live Session"):
     st.session_state.live_mode_on = True
-    # Reset data when starting a new session
     st.session_state.depth_df_raw = None
     st.session_state.last_timestamp = 0
+    st.rerun() # Immediately rerun to enter live mode
 
 if st.sidebar.button("⏹️ Stop Live Session"):
     st.session_state.live_mode_on = False
+    st.rerun() # Immediately rerun to exit live mode
 
 st.sidebar.header("2. Chart Controls")
 bin_size = st.sidebar.number_input(
@@ -117,6 +112,7 @@ bin_size = st.sidebar.number_input(
 if not st.session_state.live_mode_on:
     st.info("👋 Welcome! Click 'Start Live Session' in the sidebar to begin.")
 else:
+    # CORRECTED: Auto-refresh is now ONLY active when in live mode
     st_autorefresh(interval=5000, key="data_refresher")
 
     sessions = fetch_available_sessions()
@@ -128,7 +124,6 @@ else:
     if not todays_session_id:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
-        # Update data incrementally
         update_live_data(todays_session_id)
         
         depth_df_raw = st.session_state.get('depth_df_raw')
@@ -136,7 +131,10 @@ else:
         if depth_df_raw is None or depth_df_raw.empty:
             st.warning("Waiting for the first data snapshot...")
         else:
-            # All processing now happens on the potentially large but stable dataframe
+            depth_df_raw['Price'] = pd.to_numeric(depth_df_raw['Price'])
+            depth_df_raw['Volume'] = pd.to_numeric(depth_df_raw['Volume'])
+            depth_df_raw['datetime'] = pd.to_datetime(depth_df_raw['datetime']).dt.tz_convert('Australia/Melbourne')
+
             trade_date = depth_df_raw['datetime'].iloc[0].date()
             price_df = calculate_mid_point(depth_df_raw)
 
