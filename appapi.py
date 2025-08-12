@@ -68,10 +68,15 @@ def update_live_data(session_id):
             new_rows = parse_rows(get_snapshots(session_id, new_timestamps))
             if new_rows:
                 new_df = pd.DataFrame(new_rows)
+                
+                # --- FIX PART 1: ADD TIMEZONE LOGIC HERE ---
+                new_df['datetime'] = new_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
+
                 if st.session_state.depth_df_raw is not None:
                     st.session_state.depth_df_raw = pd.concat([st.session_state.depth_df_raw, new_df]).drop_duplicates()
                 else:
                     st.session_state.depth_df_raw = new_df
+                
                 st.session_state.last_timestamp = max(new_timestamps)
     except requests.exceptions.RequestException as e:
         st.error(f"API Error during update: {e}")
@@ -97,11 +102,11 @@ if st.sidebar.button("▶️ Start Live Session"):
     st.session_state.live_mode_on = True
     st.session_state.depth_df_raw = None
     st.session_state.last_timestamp = 0
-    st.rerun() # Immediately rerun to enter live mode
+    st.rerun()
 
 if st.sidebar.button("⏹️ Stop Live Session"):
     st.session_state.live_mode_on = False
-    st.rerun() # Immediately rerun to exit live mode
+    st.rerun()
 
 st.sidebar.header("2. Chart Controls")
 bin_size = st.sidebar.number_input(
@@ -112,7 +117,6 @@ bin_size = st.sidebar.number_input(
 if not st.session_state.live_mode_on:
     st.info("👋 Welcome! Click 'Start Live Session' in the sidebar to begin.")
 else:
-    # CORRECTED: Auto-refresh is now ONLY active when in live mode
     st_autorefresh(interval=5000, key="data_refresher")
 
     sessions = fetch_available_sessions()
@@ -125,15 +129,18 @@ else:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
         update_live_data(todays_session_id)
-        
         depth_df_raw = st.session_state.get('depth_df_raw')
 
         if depth_df_raw is None or depth_df_raw.empty:
             st.warning("Waiting for the first data snapshot...")
         else:
+            # --- FIX PART 2: REMOVE THE INCORRECT LINE FROM HERE ---
+            # This line is no longer needed as conversion is done in update_live_data
+            # depth_df_raw['datetime'] = pd.to_datetime(depth_df_raw['datetime']).dt.tz_convert('Australia/Melbourne')
+            
+            # Ensure dtypes are correct after potential concat operations
             depth_df_raw['Price'] = pd.to_numeric(depth_df_raw['Price'])
             depth_df_raw['Volume'] = pd.to_numeric(depth_df_raw['Volume'])
-            depth_df_raw['datetime'] = pd.to_datetime(depth_df_raw['datetime']).dt.tz_convert('Australia/Melbourne')
 
             trade_date = depth_df_raw['datetime'].iloc[0].date()
             price_df = calculate_mid_point(depth_df_raw)
