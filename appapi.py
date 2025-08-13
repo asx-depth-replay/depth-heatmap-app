@@ -15,6 +15,7 @@ st.title("📈 Live Market Heatmap")
 st.markdown("Click the button in the sidebar to start streaming today's live session.")
 
 # --- 3. API & Data Functions ---
+BATCH_SIZE = 1000 # Increased for faster fetching
 API_URLS = {
     'LIST_SESSIONS': 'https://list-sessions-897370608024.australia-southeast1.run.app',
     'GET_SESSION_DETAILS': 'https://get-session-details-897370608024.australia-southeast1.run.app',
@@ -38,9 +39,7 @@ def get_snapshots(session_id, timestamps):
     timestamps_str = ",".join(map(str, timestamps))
     snapshot_url = f"{API_URLS['GET_SNAPSHOTS']}?id={session_id}&timestamps={timestamps_str}"
     response = requests.get(snapshot_url)
-    if response.ok:
-        return response.json()
-    return []
+    return response.json() if response.ok else []
 
 def parse_rows(batch_data):
     """Helper function to parse JSON data into a list of dicts."""
@@ -54,7 +53,7 @@ def parse_rows(batch_data):
     return all_rows
 
 def update_live_data(session_id):
-    """Fetches only new data since the last update."""
+    """Fetches new data since the last update, with batching and a progress bar for initial loads."""
     try:
         details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
         details_response = requests.get(details_url)
@@ -65,13 +64,30 @@ def update_live_data(session_id):
         new_timestamps = [ts for ts in all_timestamps if ts > last_timestamp]
 
         if new_timestamps:
-            new_rows = parse_rows(get_snapshots(session_id, new_timestamps))
-            if new_rows:
-                new_df = pd.DataFrame(new_rows)
-                
-                # --- FIX PART 1: ADD TIMEZONE LOGIC HERE ---
-                new_df['datetime'] = new_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
+            is_initial_load = (last_timestamp == 0)
+            total_new = len(new_timestamps)
+            progress_bar = None
+            if is_initial_load and total_new > 1:
+                progress_bar = st.progress(0, text=f"Catching up with live session (0/{total_new})...")
 
+            all_new_rows = []
+            for i in range(0, total_new, BATCH_SIZE):
+                batch_timestamps = new_timestamps[i:i + BATCH_SIZE]
+                batch_data = get_snapshots(session_id, batch_timestamps)
+                all_new_rows.extend(parse_rows(batch_data))
+                
+                if progress_bar:
+                    percent_complete = min((i + BATCH_SIZE) / total_new, 1.0)
+                    progress_text = f"Catching up ({min(i + BATCH_SIZE, total_new)}/{total_new})..."
+                    progress_bar.progress(percent_complete, text=progress_text)
+
+            if progress_bar:
+                progress_bar.empty()
+
+            if all_new_rows:
+                new_df = pd.DataFrame(all_new_rows)
+                new_df['datetime'] = new_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
+                
                 if st.session_state.depth_df_raw is not None:
                     st.session_state.depth_df_raw = pd.concat([st.session_state.depth_df_raw, new_df]).drop_duplicates()
                 else:
@@ -129,18 +145,15 @@ else:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
         update_live_data(todays_session_id)
+        
         depth_df_raw = st.session_state.get('depth_df_raw')
 
         if depth_df_raw is None or depth_df_raw.empty:
             st.warning("Waiting for the first data snapshot...")
         else:
-            # --- FIX PART 2: REMOVE THE INCORRECT LINE FROM HERE ---
-            # This line is no longer needed as conversion is done in update_live_data
-            # depth_df_raw['datetime'] = pd.to_datetime(depth_df_raw['datetime']).dt.tz_convert('Australia/Melbourne')
-            
-            # Ensure dtypes are correct after potential concat operations
             depth_df_raw['Price'] = pd.to_numeric(depth_df_raw['Price'])
             depth_df_raw['Volume'] = pd.to_numeric(depth_df_raw['Volume'])
+            depth_df_raw['datetime'] = pd.to_datetime(depth_df_raw['datetime']).dt.tz_convert('Australia/Melbourne')
 
             trade_date = depth_df_raw['datetime'].iloc[0].date()
             price_df = calculate_mid_point(depth_df_raw)
