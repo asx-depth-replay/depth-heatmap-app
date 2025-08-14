@@ -15,7 +15,7 @@ st.title("📈 Live Market Heatmap")
 st.markdown("Click the button in the sidebar to start streaming today's live session.")
 
 # --- 3. API & Data Functions ---
-BATCH_SIZE = 1000 # Increased for faster fetching
+BATCH_SIZE = 200 # Increased for faster fetching
 API_URLS = {
     'LIST_SESSIONS': 'https://list-sessions-897370608024.australia-southeast1.run.app',
     'GET_SESSION_DETAILS': 'https://get-session-details-897370608024.australia-southeast1.run.app',
