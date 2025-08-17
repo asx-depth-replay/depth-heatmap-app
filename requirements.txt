@@ -5,3 +5,4 @@ plotly
 requests
 streamlit-autorefresh
 pytz
+google-generativeai

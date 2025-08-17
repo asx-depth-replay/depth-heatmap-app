@@ -6,25 +6,90 @@ import requests
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 import pytz
+import google.generativeai as genai
 
 # --- 1. Page Configuration ---
-st.set_page_config(layout="wide", page_title="Live Market Heatmap")
+st.set_page_config(layout="wide", page_title="Market Replay VCR")
 
 # --- 2. Application Title ---
-st.title("📈 Live Market Heatmap")
-st.markdown("Click the button in the sidebar to start streaming today's live session.")
+st.title("📈 Market Replay VCR")
+st.markdown("Select a session to load and replay the market heatmap with AI commentary.")
 
 # --- 3. API & Data Functions ---
-BATCH_SIZE = 200 # Increased for faster fetching
+BATCH_SIZE = 1000
 API_URLS = {
     'LIST_SESSIONS': 'https://list-sessions-897370608024.australia-southeast1.run.app',
     'GET_SESSION_DETAILS': 'https://get-session-details-897370608024.australia-southeast1.run.app',
     'GET_SNAPSHOTS': 'https://get-snapshots-897370608024.australia-southeast1.run.app'
 }
 
+# --- 4. AI Agent Functions ---
+# Configure the AI model using the secret key
+try:
+    genai.configure(api_key=st.secrets["AIzaSyACTSjkzHGdjGboFxpugt5HH2b6U3HFeN0"])
+    model = genai.GenerativeModel('gemini-1.5-flash')
+except Exception:
+    st.error("AI model could not be configured. Please check your GOOGLE_API_KEY in secrets.toml.")
+    model = None
+
+def get_ai_commentary(summary):
+    """Sends the latest data to the AI and gets a comment."""
+    if not model:
+        return "AI model not available."
+    
+    prompt = f"""
+    You are a veteran day trader with 20 years of experience watching market depth.
+    Your task is to provide a single, brief, insightful comment (25 words or less)
+    on the following market data snapshot. Focus on shifts in liquidity, potential
+    support/resistance, or overall market sentiment. Be concise and professional.
+
+    Current Data:
+    {summary}
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception:
+        return "Could not generate AI commentary at this time."
+
+def create_latest_data_summary(current_df, full_df):
+    """Analyzes the latest data and creates a text summary for the AI."""
+    if current_df.empty:
+        return "No data available."
+
+    latest_time = current_df['datetime'].max()
+    latest_snapshot = current_df[current_df['datetime'] == latest_time]
+    
+    latest_bids = latest_snapshot[latest_snapshot['Type'] == 'BUY']
+    latest_asks = latest_snapshot[latest_snapshot['Type'] == 'SELL']
+    
+    if latest_bids.empty or latest_asks.empty:
+        return "Waiting for full market data."
+
+    best_bid_row = latest_bids.loc[latest_bids['Price'].idxmax()]
+    best_ask_row = latest_asks.loc[latest_asks['Price'].idxmin()]
+    mid_point = (best_bid_row['Price'] + best_ask_row['Price']) / 2
+    spread = best_ask_row['Price'] - best_bid_row['Price']
+
+    five_mins_ago = latest_time - pd.Timedelta(minutes=5)
+    past_snapshot_df = full_df[full_df['datetime'] <= five_mins_ago]
+    if not past_snapshot_df.empty:
+        past_mid_point_df = calculate_price_lines(past_snapshot_df)
+        past_mid_point = past_mid_point_df.iloc[-1]['mid_point']
+        trend_delta = mid_point - past_mid_point
+        trend_summary = f"Trending Up (+${trend_delta:.2f} in last 5 mins)" if trend_delta > 0 else f"Trending Down (-${abs(trend_delta):.2f} in last 5 mins)"
+    else:
+        trend_summary = "Not enough data for a 5-minute trend."
+        
+    summary = f"""Timestamp: {latest_time.strftime('%H:%M:%S')} AEST
+Mid-Point: ${mid_point:.2f}
+Spread: ${spread:.2f}
+5-Minute Trend: {trend_summary}"""
+    return summary
+
+# --- The rest of the data functions remain the same ---
 @st.cache_data(ttl=300)
 def fetch_available_sessions():
-    """Fetches the list of available sessions from the Firestore API."""
     try:
         response = requests.get(API_URLS['LIST_SESSIONS'])
         response.raise_for_status()
@@ -34,7 +99,6 @@ def fetch_available_sessions():
         return []
 
 def get_snapshots(session_id, timestamps):
-    """Helper function to fetch a batch of snapshots."""
     if not timestamps: return []
     timestamps_str = ",".join(map(str, timestamps))
     snapshot_url = f"{API_URLS['GET_SNAPSHOTS']}?id={session_id}&timestamps={timestamps_str}"
@@ -42,7 +106,6 @@ def get_snapshots(session_id, timestamps):
     return response.json() if response.ok else []
 
 def parse_rows(batch_data):
-    """Helper function to parse JSON data into a list of dicts."""
     all_rows = []
     for snapshot in batch_data:
         dt = pd.to_datetime(snapshot.get('timestamp'), unit='ms')
@@ -52,149 +115,155 @@ def parse_rows(batch_data):
             all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size')})
     return all_rows
 
-def update_live_data(session_id):
-    """Fetches new data since the last update, with batching and a progress bar for initial loads."""
-    try:
-        details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
-        details_response = requests.get(details_url)
-        details_response.raise_for_status()
-        all_timestamps = details_response.json().get('timestamps', [])
-        
-        last_timestamp = st.session_state.get('last_timestamp', 0)
-        new_timestamps = [ts for ts in all_timestamps if ts > last_timestamp]
+def process_dataframe(df):
+    df.dropna(inplace=True)
+    for col in ['Price', 'Volume']:
+        df[col] = pd.to_numeric(df[col])
+    df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
+    df.sort_values('datetime', inplace=True)
+    return df
 
-        if new_timestamps:
-            is_initial_load = (last_timestamp == 0)
-            total_new = len(new_timestamps)
-            progress_bar = None
-            if is_initial_load and total_new > 1:
-                progress_bar = st.progress(0, text=f"Catching up with live session (0/{total_new})...")
+@st.cache_data
+def load_historical_data(session_id):
+    details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
+    details_response = requests.get(details_url)
+    details_response.raise_for_status()
+    timestamps = details_response.json().get('timestamps', [])
+    if not timestamps: return None
+    all_rows = []
+    for i in range(0, len(timestamps), BATCH_SIZE):
+        batch_data = get_snapshots(session_id, timestamps[i:i + BATCH_SIZE])
+        all_rows.extend(parse_rows(batch_data))
+    if not all_rows: return None
+    return process_dataframe(pd.DataFrame(all_rows))
 
-            all_new_rows = []
-            for i in range(0, total_new, BATCH_SIZE):
-                batch_timestamps = new_timestamps[i:i + BATCH_SIZE]
-                batch_data = get_snapshots(session_id, batch_timestamps)
-                all_new_rows.extend(parse_rows(batch_data))
-                
-                if progress_bar:
-                    percent_complete = min((i + BATCH_SIZE) / total_new, 1.0)
-                    progress_text = f"Catching up ({min(i + BATCH_SIZE, total_new)}/{total_new})..."
-                    progress_bar.progress(percent_complete, text=progress_text)
-
-            if progress_bar:
-                progress_bar.empty()
-
-            if all_new_rows:
-                new_df = pd.DataFrame(all_new_rows)
-                new_df['datetime'] = new_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
-                
-                if st.session_state.depth_df_raw is not None:
-                    st.session_state.depth_df_raw = pd.concat([st.session_state.depth_df_raw, new_df]).drop_duplicates()
-                else:
-                    st.session_state.depth_df_raw = new_df
-                
-                st.session_state.last_timestamp = max(new_timestamps)
-    except requests.exceptions.RequestException as e:
-        st.error(f"API Error during update: {e}")
-
-def calculate_mid_point(df):
-    """Calculates the mid-point for each timestamp in a vectorized way."""
+def calculate_price_lines(df):
+    if df.empty: return pd.DataFrame(columns=['datetime', 'best_bid', 'best_bid_volume', 'best_ask', 'best_ask_volume', 'mid_point'])
     bids = df[df['Type'] == 'BUY'].groupby('datetime')['Price'].max().rename('best_bid')
     asks = df[df['Type'] == 'SELL'].groupby('datetime')['Price'].min().rename('best_ask')
-    merged_df = pd.concat([bids, asks], axis=1).dropna()
-    merged_df['mid_point'] = (merged_df['best_bid'] + merged_df['best_ask']) / 2
-    return merged_df.reset_index()
+    price_lines_df = pd.concat([bids, asks], axis=1).dropna()
+    price_lines_df['mid_point'] = (price_lines_df['best_bid'] + price_lines_df['best_ask']) / 2
+    return price_lines_df.reset_index()
 
-# --- 4. Sidebar Controls ---
+
+# --- Sidebar Controls ---
 st.sidebar.title("Controls")
-st.sidebar.header("1. Live Session")
+st.sidebar.header("1. Select Session")
+sessions = fetch_available_sessions()
+session_names = [s.get('name', s.get('id')) for s in sessions]
+placeholder = "--- Select a session ---"
+options = [placeholder] + session_names
+selected_session_name = st.sidebar.selectbox("Choose a session to replay", options=options)
+selected_session_id = None
+if selected_session_name != placeholder:
+    selected_session_id = next((s.get('id') for s in sessions if s.get('name', s.get('id')) == selected_session_name), None)
 
-if 'live_mode_on' not in st.session_state:
-    st.session_state.live_mode_on = False
-    st.session_state.depth_df_raw = None
-    st.session_state.last_timestamp = 0
-
-if st.sidebar.button("▶️ Start Live Session"):
-    st.session_state.live_mode_on = True
-    st.session_state.depth_df_raw = None
-    st.session_state.last_timestamp = 0
-    st.rerun()
-
-if st.sidebar.button("⏹️ Stop Live Session"):
-    st.session_state.live_mode_on = False
-    st.rerun()
-
-st.sidebar.header("2. Chart Controls")
-bin_size = st.sidebar.number_input(
-    "Set Price Bin Size ($)", min_value=0.01, max_value=0.20, value=0.05, step=0.01, format="%.2f"
-)
-
-# --- 5. Main Application Logic ---
-if not st.session_state.live_mode_on:
-    st.info("👋 Welcome! Click 'Start Live Session' in the sidebar to begin.")
+# --- Main Application Logic ---
+if not selected_session_id:
+    st.info("👋 Welcome! Please select a session to begin.")
 else:
-    st_autorefresh(interval=5000, key="data_refresher")
+    with st.spinner("Loading session data... This may take a moment on first load."):
+        full_depth_df = load_historical_data(selected_session_id)
 
-    sessions = fetch_available_sessions()
-    au_tz = pytz.timezone('Australia/Melbourne')
-    today_str = datetime.now(au_tz).strftime('%Y%m%d')
-    
-    todays_session_id = next((s['id'] for s in sessions if s.get('id', '').startswith(today_str)), None)
-    
-    if not todays_session_id:
-        st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
+    if full_depth_df is None or full_depth_df.empty:
+        st.error("Could not load data for the selected session.")
     else:
-        update_live_data(todays_session_id)
-        
-        depth_df_raw = st.session_state.get('depth_df_raw')
+        # Filter to session hours
+        trade_date = full_depth_df['datetime'].iloc[0].date()
+        SESSION_START = pd.to_datetime(f"{trade_date} 10:00:00").tz_localize('Australia/Melbourne')
+        SESSION_END = pd.to_datetime(f"{trade_date} 16:00:00").tz_localize('Australia/Melbourne')
+        full_depth_df = full_depth_df[(full_depth_df['datetime'] >= SESSION_START) & (full_depth_df['datetime'] < SESSION_END)]
 
-        if depth_df_raw is None or depth_df_raw.empty:
-            st.warning("Waiting for the first data snapshot...")
+        if full_depth_df.empty:
+            st.warning("No data found within the 10:00 AM - 4:00 PM trading session.")
         else:
-            depth_df_raw['Price'] = pd.to_numeric(depth_df_raw['Price'])
-            depth_df_raw['Volume'] = pd.to_numeric(depth_df_raw['Volume'])
-            depth_df_raw['datetime'] = pd.to_datetime(depth_df_raw['datetime']).dt.tz_convert('Australia/Melbourne')
+            unique_timestamps = full_depth_df['datetime'].unique()
+            st.sidebar.header("2. VCR Controls")
 
-            trade_date = depth_df_raw['datetime'].iloc[0].date()
-            price_df = calculate_mid_point(depth_df_raw)
+            # Initialize session state for VCR and AI
+            if 'playhead_index' not in st.session_state or st.session_state.get('session_id') != selected_session_id:
+                st.session_state.is_playing = False
+                st.session_state.playhead_index = 0
+                st.session_state.session_id = selected_session_id
+                st.session_state.last_comment = "AI Commentary will appear here. Press Play to begin."
+                st.session_state.last_comment_time = None
 
-            SESSION_START = pd.to_datetime(f"{trade_date} 10:00:00").tz_localize('Australia/Melbourne')
-            SESSION_END = pd.to_datetime(f"{trade_date} 16:00:00").tz_localize('Australia/Melbourne')
+            vcr_cols = st.sidebar.columns(2)
+            if vcr_cols[0].button("▶️ Play / ⏸️ Pause"):
+                st.session_state.is_playing = not st.session_state.is_playing
+            if vcr_cols[1].button("⏮️ Reset"):
+                st.session_state.is_playing = False
+                st.session_state.playhead_index = 0
+                st.session_state.last_comment = "AI Commentary will appear here. Press Play to begin."
+                st.session_state.last_comment_time = None
+
+            replay_speed = st.sidebar.select_slider("Replay Speed", options=[1, 5, 10, 20, 50, 100, 200], value=20)
+            scrubber_val = st.sidebar.slider("Timeline", 0, len(unique_timestamps) - 1, st.session_state.playhead_index)
+            if scrubber_val != st.session_state.playhead_index:
+                st.session_state.playhead_index = scrubber_val
+                st.session_state.is_playing = False
+
+            if st.session_state.is_playing:
+                st_autorefresh(interval=100, key="vcr_refresher")
+                avg_time_delta = pd.to_timedelta(np.diff(unique_timestamps).mean()).total_seconds()
+                snaps_per_sec = 1 / avg_time_delta if avg_time_delta > 0 else 1
+                increment = max(1, int(snaps_per_sec * replay_speed * 0.1))
+                st.session_state.playhead_index = min(st.session_state.playhead_index + increment, len(unique_timestamps) - 1)
+                if st.session_state.playhead_index == len(unique_timestamps) - 1:
+                    st.session_state.is_playing = False
+
+            current_timestamp = unique_timestamps[st.session_state.playhead_index]
+            display_df = full_depth_df[full_depth_df['datetime'] <= current_timestamp]
             
-            depth_df = depth_df_raw[(depth_df_raw['datetime'] >= SESSION_START) & (depth_df_raw['datetime'] < SESSION_END)]
-            price_df = price_df[(price_df['datetime'] >= SESSION_START) & (price_df['datetime'] < SESSION_END)]
+            st.header(f"Replaying Session: {selected_session_name}")
+            st.subheader(f"Time: {current_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            last_update_time = depth_df_raw['datetime'].max().strftime('%H:%M:%S')
-            st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time})")
+            # --- AI Commentary Logic ---
+            time_since_last_comment = (current_timestamp - st.session_state.last_comment_time).total_seconds() if st.session_state.last_comment_time else float('inf')
+            # Get new comment if playing and 60 seconds of session time have passed
+            if st.session_state.is_playing and time_since_last_comment > 60:
+                summary = create_latest_data_summary(display_df, full_depth_df)
+                st.session_state.last_comment = get_ai_commentary(summary)
+                st.session_state.last_comment_time = current_timestamp
             
-            if depth_df.empty or price_df.empty:
-                st.warning("Waiting for data within the main trading session (10:00 AM - 4:00 PM)...")
+            with st.expander("👨‍💻 Veteran Trader AI Commentary", expanded=True):
+                st.write(st.session_state.last_comment)
+            
+            # --- Charting Logic ---
+            price_lines_df = calculate_price_lines(display_df)
+            
+            if display_df.empty or price_lines_df.empty:
+                st.warning("No data to display for the current time in the replay.")
             else:
-                depth_df['SignedVolume'] = np.where(depth_df['Type'] == 'BUY', depth_df['Volume'], -depth_df['Volume'])
-                min_price = price_df['mid_point'].min() - 0.50
-                max_price = price_df['mid_point'].max() + 0.50
+                bin_size = st.sidebar.number_input("Set Price Bin Size ($)", 0.01, 0.20, 0.05, 0.01, "%.2f")
+                display_df['SignedVolume'] = np.where(display_df['Type'] == 'BUY', display_df['Volume'], -display_df['Volume'])
+                full_price_lines_df = calculate_price_lines(full_depth_df)
+                min_price = full_price_lines_df['best_bid'].min() - 0.50
+                max_price = full_price_lines_df['best_ask'].max() + 0.50
                 price_bins = np.arange(np.floor(min_price), np.ceil(max_price) + bin_size, bin_size)
                 
-                depth_df['price_bin'] = pd.cut(depth_df['Price'], bins=price_bins, right=False)
-                binned_heatmap = depth_df.pivot_table(
-                    index='price_bin', columns='datetime', values='SignedVolume', aggfunc='sum', observed=True
-                ).fillna(0)
-
+                display_df['price_bin'] = pd.cut(display_df['Price'], bins=price_bins, right=False)
+                binned_heatmap = display_df.pivot_table(index='price_bin', columns='datetime', values='SignedVolume', aggfunc='sum', observed=True).fillna(0)
+                
                 fig = go.Figure()
                 non_zero_values = binned_heatmap.values[binned_heatmap.values != 0]
                 clip_level = np.percentile(np.abs(non_zero_values), 95) if non_zero_values.size > 0 else 1
                 
                 fig.add_trace(go.Heatmap(
-                    x=binned_heatmap.columns, y=[interval.left for interval in binned_heatmap.index], z=binned_heatmap.values,
+                    x=binned_heatmap.columns, y=[b.left for b in binned_heatmap.index], z=binned_heatmap.values,
                     colorscale='RdBu', zmid=0, zmin=-clip_level, zmax=clip_level,
                     name='Net Liquidity', hoverinfo='none', colorbar=dict(x=1.0, title='Net Liquidity')
                 ))
-                
                 fig.add_trace(go.Scatter(
-                    x=price_df['datetime'], y=price_df['mid_point'],
-                    mode='lines', name='Mid-Point', line=dict(color='rgba(0, 0, 0, 0.8)', width=2, dash='dash'),
-                    hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>Mid-Point:</b> $%{y:.3f}<extra></extra>'
+                    x=price_lines_df['datetime'], y=price_lines_df['best_bid'],
+                    mode='lines', name='Best Bid', line=dict(color='green', width=2, dash='dash'),
+                    hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>Best Bid:</b> $%{y:.3f}<extra></extra>'
+                ))
+                fig.add_trace(go.Scatter(
+                    x=price_lines_df['datetime'], y=price_lines_df['best_ask'],
+                    mode='lines', name='Best Ask', line=dict(color='black', width=2, dash='dash'),
+                    hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>Best Ask:</b> $%{y:.3f}<extra></extra>'
                 ))
                 
-                fig.update_layout(height=650, title_text='Market Heatmap with Price Overlay', yaxis_title='Price Level')
+                fig.update_layout(height=650, title_text='Market Heatmap Replay', yaxis_title='Price Level')
                 st.plotly_chart(fig, use_container_width=True)
