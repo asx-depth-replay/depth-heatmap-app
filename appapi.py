@@ -26,7 +26,7 @@ API_URLS = {
 # --- 4. AI Agent Functions ---
 # Configure the AI model using the secret key
 try:
-    genai.configure(api_key=st.secrets["AIzaSyACTSjkzHGdjGboFxpugt5HH2b6U3HFeN0"])
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
     model = genai.GenerativeModel('gemini-1.5-flash')
 except Exception:
     st.error("AI model could not be configured. Please check your GOOGLE_API_KEY in secrets.toml.")
