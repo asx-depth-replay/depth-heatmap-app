@@ -24,7 +24,6 @@ API_URLS = {
 
 @st.cache_data(ttl=300)
 def fetch_available_sessions():
-    """Fetches the list of available sessions from the Firestore API."""
     try:
         response = requests.get(API_URLS['LIST_SESSIONS'])
         response.raise_for_status()
@@ -51,13 +50,11 @@ def parse_rows(batch_data):
     return all_rows
 
 def initial_load_with_progress(session_id):
-    """Performs a one-time, full download of all available data with a progress bar."""
     try:
         details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
         details_response = requests.get(details_url)
         details_response.raise_for_status()
         timestamps = details_response.json().get('timestamps', [])
-        
         if not timestamps:
             st.warning("Waiting for the first data snapshot...")
             return
@@ -65,16 +62,13 @@ def initial_load_with_progress(session_id):
         total_timestamps = len(timestamps)
         progress_bar = st.progress(0, text=f"Catching up with live session (0/{total_timestamps})...")
         all_rows = []
-
         for i in range(0, total_timestamps, BATCH_SIZE):
             batch_timestamps = timestamps[i:i + BATCH_SIZE]
             batch_data = get_snapshots(session_id, batch_timestamps)
             all_rows.extend(parse_rows(batch_data))
-            
             percent_complete = min((i + BATCH_SIZE) / total_timestamps, 1.0)
             progress_text = f"Catching up ({min(i + BATCH_SIZE, total_timestamps)}/{total_timestamps})..."
             progress_bar.progress(percent_complete, text=progress_text)
-        
         progress_bar.empty()
         
         if all_rows:
@@ -82,12 +76,10 @@ def initial_load_with_progress(session_id):
             df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
             st.session_state.depth_df_raw = df
             st.session_state.last_timestamp = max(timestamps)
-
     except requests.exceptions.RequestException as e:
         st.error(f"API Error during initial load: {e}")
 
 def incremental_update(session_id):
-    """Fetches only new, incremental data. Designed to be fast."""
     try:
         details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
         details_response = requests.get(details_url)
@@ -96,7 +88,6 @@ def incremental_update(session_id):
         
         last_timestamp = st.session_state.get('last_timestamp', 0)
         new_timestamps = [ts for ts in all_timestamps if ts > last_timestamp]
-
         if new_timestamps:
             new_rows = parse_rows(get_snapshots(session_id, new_timestamps))
             if new_rows:
@@ -105,16 +96,40 @@ def incremental_update(session_id):
                 st.session_state.depth_df_raw = pd.concat([st.session_state.depth_df_raw, new_df]).drop_duplicates()
                 st.session_state.last_timestamp = max(new_timestamps)
     except requests.exceptions.RequestException:
-        # Fail silently on minor refresh errors
         pass
 
 def calculate_mid_point(df):
-    """Calculates the mid-point for each timestamp in a vectorized way."""
     bids = df[df['Type'] == 'BUY'].groupby('datetime')['Price'].max().rename('best_bid')
     asks = df[df['Type'] == 'SELL'].groupby('datetime')['Price'].min().rename('best_ask')
     merged_df = pd.concat([bids, asks], axis=1).dropna()
     merged_df['mid_point'] = (merged_df['best_bid'] + merged_df['best_ask']) / 2
     return merged_df.reset_index()
+
+def calculate_dashboard_metrics(current_snapshot, prev_metrics):
+    """Calculates a full dashboard of metrics from the latest snapshot."""
+    metrics = {}
+    bids = current_snapshot[current_snapshot['Type'] == 'BUY']
+    asks = current_snapshot[current_snapshot['Type'] == 'SELL']
+
+    if bids.empty or asks.empty: return prev_metrics
+
+    metrics['Best Bid'] = bids['Price'].max()
+    metrics['Best Ask'] = asks['Price'].min()
+    metrics['Spread'] = metrics['Best Ask'] - metrics['Best Ask']
+    
+    top_10_bids = bids.nlargest(10, 'Price')
+    top_10_asks = asks.nsmallest(10, 'Price')
+    metrics['Top-10 Buy Volume'] = top_10_bids['Volume'].sum()
+    metrics['Top-10 Sell Volume'] = top_10_asks['Volume'].sum()
+    total_top_10_vol = metrics['Top-10 Buy Volume'] + metrics['Top-10 Sell Volume']
+    metrics['Imbalance Ratio'] = (metrics['Top-10 Buy Volume'] / total_top_10_vol) if total_top_10_vol > 0 else 0.5
+    
+    metrics['Total Buy Volume'] = bids['Volume'].sum()
+    metrics['Total Sell Volume'] = asks['Volume'].sum()
+    metrics['Buy/Sell Delta'] = metrics['Total Buy Volume'] - metrics['Total Sell Volume']
+
+    metrics['prev_metrics'] = prev_metrics
+    return metrics
 
 # --- 4. Sidebar Controls ---
 st.sidebar.title("Controls")
@@ -122,11 +137,13 @@ st.sidebar.header("1. Live Session")
 
 if 'live_mode_on' not in st.session_state:
     st.session_state.live_mode_on = False
+    st.session_state.prev_metrics = {}
 
 if st.sidebar.button("▶️ Start Live Session"):
     st.session_state.live_mode_on = True
-    st.session_state.depth_df_raw = None # Reset data
+    st.session_state.depth_df_raw = None
     st.session_state.last_timestamp = 0
+    st.session_state.prev_metrics = {}
     st.rerun()
 
 if st.sidebar.button("⏹️ Stop Live Session"):
@@ -147,14 +164,11 @@ else:
     if not todays_session_id:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
-        # --- NEW LOGIC: SEPARATE INITIAL LOAD FROM LIVE UPDATE ---
         is_initial_load = st.session_state.get('depth_df_raw') is None
         
         if is_initial_load:
-            # Perform the one-time, blocking catch-up load.
             initial_load_with_progress(todays_session_id)
         else:
-            # Only after the initial load, start the auto-refresher and incremental updates.
             st_autorefresh(interval=5000, key="data_refresher")
             incremental_update(todays_session_id)
         
@@ -163,9 +177,30 @@ else:
         if depth_df_raw is None or depth_df_raw.empty:
             st.warning("Waiting for session data...")
         else:
-            # --- Charting logic is now safe to run ---
             depth_df_raw['Price'] = pd.to_numeric(depth_df_raw['Price'])
             depth_df_raw['Volume'] = pd.to_numeric(depth_df_raw['Volume'])
+
+            last_update_time = depth_df_raw['datetime'].max()
+            st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time.strftime('%H:%M:%S')})")
+            
+            latest_snapshot = depth_df_raw[depth_df_raw['datetime'] == last_update_time]
+            metrics = calculate_dashboard_metrics(latest_snapshot, st.session_state.prev_metrics)
+            st.session_state.prev_metrics = metrics
+
+            if metrics:
+                prev_metrics = metrics.get('prev_metrics', {})
+                cols = st.columns(3)
+                
+                cols[0].metric("Best Bid / Ask", f"${metrics['Best Bid']:.2f} / ${metrics['Best Ask']:.2f}", f"Spread: ${metrics['Spread']:.2f}")
+                
+                top_10_buy_delta = metrics['Top-10 Buy Volume'] - prev_metrics.get('Top-10 Buy Volume', 0)
+                top_10_sell_delta = metrics['Top-10 Sell Volume'] - prev_metrics.get('Top-10 Sell Volume', 0)
+                cols[1].metric("Top 10 Depth (Buy/Sell)", f"{metrics['Top-10 Buy Volume']:,} / {metrics['Top-10 Sell Volume']:,}", f"Δ: {top_10_buy_delta:+,.0f} / {top_10_sell_delta:+,.0f}")
+                cols[1].metric("Total Visible Depth (Buy/Sell)", f"{metrics['Total Buy Volume']:,} / {metrics['Total Sell Volume']:,}")
+                
+                cols[2].metric("Top 10 Imbalance", f"{metrics['Imbalance Ratio']:.1%}", "Buy-Side")
+                cols[2].metric("Buy/Sell Delta", f"{metrics['Buy/Sell Delta']:+,.0f}")
+            st.markdown("---")
 
             trade_date = depth_df_raw['datetime'].iloc[0].date()
             price_df = calculate_mid_point(depth_df_raw)
@@ -175,9 +210,6 @@ else:
             
             depth_df = depth_df_raw[(depth_df_raw['datetime'] >= SESSION_START) & (depth_df_raw['datetime'] < SESSION_END)]
             price_df = price_df[(price_df['datetime'] >= SESSION_START) & (price_df['datetime'] < SESSION_END)]
-
-            last_update_time = depth_df_raw['datetime'].max().strftime('%H:%M:%S')
-            st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time})")
             
             if depth_df.empty or price_df.empty:
                 st.warning("Waiting for data within the main trading session (10:00 AM - 4:00 PM)...")
@@ -189,7 +221,7 @@ else:
                 
                 depth_df['price_bin'] = pd.cut(depth_df['Price'], bins=price_bins, right=False)
                 binned_heatmap = depth_df.pivot_table(index='price_bin', columns='datetime', values='SignedVolume', aggfunc='sum', observed=True).fillna(0)
-
+                
                 fig = go.Figure()
                 non_zero_values = binned_heatmap.values[binned_heatmap.values != 0]
                 clip_level = np.percentile(np.abs(non_zero_values), 95) if non_zero_values.size > 0 else 1
