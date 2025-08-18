@@ -24,6 +24,7 @@ API_URLS = {
 
 @st.cache_data(ttl=300)
 def fetch_available_sessions():
+    """Fetches the list of available sessions from the Firestore API."""
     try:
         response = requests.get(API_URLS['LIST_SESSIONS'])
         response.raise_for_status()
@@ -114,16 +115,11 @@ def calculate_dashboard_metrics(current_snapshot, prev_metrics):
     metrics['Best Bid'] = bids['Price'].max()
     metrics['Best Ask'] = asks['Price'].min()
     metrics['Spread'] = metrics['Best Ask'] - metrics['Best Bid']
-    
-    top_10_bids = bids.nlargest(10, 'Price')
-    top_10_asks = asks.nsmallest(10, 'Price')
-    metrics['Top-10 Buy Volume'] = top_10_bids['Volume'].sum()
-    metrics['Top-10 Sell Volume'] = top_10_asks['Volume'].sum()
-    
+    metrics['Top-10 Buy Volume'] = bids.nlargest(10, 'Price')['Volume'].sum()
+    metrics['Top-10 Sell Volume'] = asks.nsmallest(10, 'Price')['Volume'].sum()
     metrics['Total Buy Volume'] = bids['Volume'].sum()
     metrics['Total Sell Volume'] = asks['Volume'].sum()
     metrics['Buy/Sell Delta'] = metrics['Total Buy Volume'] - metrics['Total Sell Volume']
-    
     total_top_10_vol = metrics['Top-10 Buy Volume'] + metrics['Top-10 Sell Volume']
     metrics['Imbalance Ratio'] = (metrics['Top-10 Buy Volume'] / total_top_10_vol) if total_top_10_vol > 0 else 0.5
     metrics['prev_metrics'] = prev_metrics
@@ -150,15 +146,22 @@ st.sidebar.header("1. Live Session")
 if 'live_mode_on' not in st.session_state:
     st.session_state.live_mode_on = False
     st.session_state.prev_metrics = {}
+    st.session_state.is_paused = False
 if st.sidebar.button("▶️ Start Live Session"):
     st.session_state.live_mode_on = True
+    st.session_state.is_paused = False
     st.session_state.depth_df_raw = None
     st.session_state.last_timestamp = 0
     st.session_state.prev_metrics = {}
     st.rerun()
-if st.sidebar.button("⏹️ Stop Live Session"):
-    st.session_state.live_mode_on = False
-    st.rerun()
+
+if st.session_state.live_mode_on:
+    if st.sidebar.button("⏸️ Pause / ▶️ Continue"):
+        st.session_state.is_paused = not st.session_state.is_paused
+        st.rerun()
+    pause_status = "PAUSED" if st.session_state.is_paused else "RUNNING"
+    st.sidebar.caption(f"Status: {pause_status}")
+
 st.sidebar.header("2. Chart Controls")
 bin_size = st.sidebar.number_input("Set Price Bin Size ($)", 0.01, 0.20, 0.05, 0.01, "%.2f")
 
@@ -174,9 +177,11 @@ else:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
         is_initial_load = st.session_state.get('depth_df_raw') is None
+        
         if is_initial_load:
             initial_load_with_progress(todays_session_id)
-        else:
+        
+        if not st.session_state.get('is_paused', False) and not is_initial_load:
             st_autorefresh(interval=5000, key="data_refresher")
             incremental_update(todays_session_id)
         
