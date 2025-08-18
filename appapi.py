@@ -106,50 +106,59 @@ def calculate_mid_point(df):
     return merged_df.reset_index()
 
 def calculate_dashboard_metrics(current_snapshot, prev_metrics):
-    """Calculates a full dashboard of metrics from the latest snapshot."""
     metrics = {}
     bids = current_snapshot[current_snapshot['Type'] == 'BUY']
     asks = current_snapshot[current_snapshot['Type'] == 'SELL']
-
     if bids.empty or asks.empty: return prev_metrics
 
     metrics['Best Bid'] = bids['Price'].max()
     metrics['Best Ask'] = asks['Price'].min()
-    metrics['Spread'] = metrics['Best Ask'] - metrics['Best Ask']
+    metrics['Spread'] = metrics['Best Ask'] - metrics['Best Bid']
     
     top_10_bids = bids.nlargest(10, 'Price')
     top_10_asks = asks.nsmallest(10, 'Price')
     metrics['Top-10 Buy Volume'] = top_10_bids['Volume'].sum()
     metrics['Top-10 Sell Volume'] = top_10_asks['Volume'].sum()
-    total_top_10_vol = metrics['Top-10 Buy Volume'] + metrics['Top-10 Sell Volume']
-    metrics['Imbalance Ratio'] = (metrics['Top-10 Buy Volume'] / total_top_10_vol) if total_top_10_vol > 0 else 0.5
     
     metrics['Total Buy Volume'] = bids['Volume'].sum()
     metrics['Total Sell Volume'] = asks['Volume'].sum()
     metrics['Buy/Sell Delta'] = metrics['Total Buy Volume'] - metrics['Total Sell Volume']
-
+    
+    total_top_10_vol = metrics['Top-10 Buy Volume'] + metrics['Top-10 Sell Volume']
+    metrics['Imbalance Ratio'] = (metrics['Top-10 Buy Volume'] / total_top_10_vol) if total_top_10_vol > 0 else 0.5
     metrics['prev_metrics'] = prev_metrics
     return metrics
+
+def create_depth_chart(snapshot_df):
+    """Creates a cumulative market depth chart for a single snapshot."""
+    bids = snapshot_df[snapshot_df['Type'] == 'BUY'].sort_values('Price', ascending=False)
+    asks = snapshot_df[snapshot_df['Type'] == 'SELL'].sort_values('Price', ascending=True)
+
+    bids['Accumulated'] = bids['Volume'].cumsum()
+    asks['Accumulated'] = asks['Volume'].cumsum()
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bids['Price'], y=bids['Accumulated'], mode='lines', name='Bids', line=dict(color='green'), fill='tozeroy'))
+    fig.add_trace(go.Scatter(x=asks['Price'], y=asks['Accumulated'], mode='lines', name='Asks', line=dict(color='red'), fill='tozeroy'))
+    
+    fig.update_layout(title_text='Market Depth Chart', xaxis_title='Price', yaxis_title='Accumulated Volume', height=400)
+    return fig
 
 # --- 4. Sidebar Controls ---
 st.sidebar.title("Controls")
 st.sidebar.header("1. Live Session")
-
 if 'live_mode_on' not in st.session_state:
     st.session_state.live_mode_on = False
     st.session_state.prev_metrics = {}
-
 if st.sidebar.button("▶️ Start Live Session"):
     st.session_state.live_mode_on = True
     st.session_state.depth_df_raw = None
     st.session_state.last_timestamp = 0
     st.session_state.prev_metrics = {}
     st.rerun()
-
 if st.sidebar.button("⏹️ Stop Live Session"):
     st.session_state.live_mode_on = False
     st.rerun()
-
 st.sidebar.header("2. Chart Controls")
 bin_size = st.sidebar.number_input("Set Price Bin Size ($)", 0.01, 0.20, 0.05, 0.01, "%.2f")
 
@@ -165,7 +174,6 @@ else:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
         is_initial_load = st.session_state.get('depth_df_raw') is None
-        
         if is_initial_load:
             initial_load_with_progress(todays_session_id)
         else:
@@ -173,7 +181,6 @@ else:
             incremental_update(todays_session_id)
         
         depth_df_raw = st.session_state.get('depth_df_raw')
-
         if depth_df_raw is None or depth_df_raw.empty:
             st.warning("Waiting for session data...")
         else:
@@ -190,7 +197,6 @@ else:
             if metrics:
                 prev_metrics = metrics.get('prev_metrics', {})
                 cols = st.columns(3)
-                
                 cols[0].metric("Best Bid / Ask", f"${metrics['Best Bid']:.2f} / ${metrics['Best Ask']:.2f}", f"Spread: ${metrics['Spread']:.2f}")
                 
                 top_10_buy_delta = metrics['Top-10 Buy Volume'] - prev_metrics.get('Top-10 Buy Volume', 0)
@@ -204,7 +210,6 @@ else:
 
             trade_date = depth_df_raw['datetime'].iloc[0].date()
             price_df = calculate_mid_point(depth_df_raw)
-
             SESSION_START = pd.to_datetime(f"{trade_date} 10:00:00").tz_localize('Australia/Melbourne')
             SESSION_END = pd.to_datetime(f"{trade_date} 16:00:00").tz_localize('Australia/Melbourne')
             
@@ -240,3 +245,12 @@ else:
                 
                 fig.update_layout(height=650, title_text='Market Heatmap with Price Overlay', yaxis_title='Price Level')
                 st.plotly_chart(fig, use_container_width=True)
+
+                # --- NEW: Add the Market Depth Chart Expander ---
+                with st.expander("Show Market Depth Chart"):
+                    current_snapshot_df = depth_df_raw[depth_df_raw['datetime'] == last_update_time]
+                    if not current_snapshot_df.empty:
+                        depth_fig = create_depth_chart(current_snapshot_df)
+                        st.plotly_chart(depth_fig, use_container_width=True)
+                    else:
+                        st.write("No snapshot data to display.")
