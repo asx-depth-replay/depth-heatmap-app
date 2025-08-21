@@ -41,13 +41,18 @@ def get_snapshots(session_id, timestamps):
     return response.json() if response.ok else []
 
 def parse_rows(batch_data):
+    """Helper function to parse JSON data, including new volume metrics."""
     all_rows = []
     for snapshot in batch_data:
         dt = pd.to_datetime(snapshot.get('timestamp'), unit='ms')
+        total_traded_volume = snapshot.get('totalTradedVolume')
+        volume_change = snapshot.get('volumeChange')
         for order in snapshot.get('bids', []):
-            all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size')})
+            all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size'),
+                             'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
         for order in snapshot.get('asks', []):
-            all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size')})
+            all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size'),
+                             'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
     return all_rows
 
 def initial_load_with_progress(session_id):
@@ -107,16 +112,26 @@ def calculate_mid_point(df):
     return merged_df.reset_index()
 
 def calculate_dashboard_metrics(current_snapshot, prev_metrics):
+    """Calculates a full dashboard of metrics from the latest snapshot."""
     metrics = {}
     bids = current_snapshot[current_snapshot['Type'] == 'BUY']
     asks = current_snapshot[current_snapshot['Type'] == 'SELL']
     if bids.empty or asks.empty: return prev_metrics
 
+    # Extract new top-level metrics
+    if 'totalTradedVolume' in current_snapshot.columns:
+        metrics['Total Traded Volume'] = current_snapshot['totalTradedVolume'].iloc[0]
+        metrics['Volume Change'] = current_snapshot['volumeChange'].iloc[0]
+
     metrics['Best Bid'] = bids['Price'].max()
     metrics['Best Ask'] = asks['Price'].min()
     metrics['Spread'] = metrics['Best Ask'] - metrics['Best Bid']
-    metrics['Top-10 Buy Volume'] = bids.nlargest(10, 'Price')['Volume'].sum()
-    metrics['Top-10 Sell Volume'] = asks.nsmallest(10, 'Price')['Volume'].sum()
+    metrics['Best Bid Volume'] = bids[bids['Price'] == metrics['Best Bid']]['Volume'].sum()
+    metrics['Best Ask Volume'] = asks[asks['Price'] == metrics['Best Ask']]['Volume'].sum()
+    top_10_bids = bids.nlargest(10, 'Price')
+    top_10_asks = asks.nsmallest(10, 'Price')
+    metrics['Top-10 Buy Volume'] = top_10_bids['Volume'].sum()
+    metrics['Top-10 Sell Volume'] = top_10_asks['Volume'].sum()
     metrics['Total Buy Volume'] = bids['Volume'].sum()
     metrics['Total Sell Volume'] = asks['Volume'].sum()
     metrics['Buy/Sell Delta'] = metrics['Total Buy Volume'] - metrics['Total Sell Volume']
@@ -126,7 +141,6 @@ def calculate_dashboard_metrics(current_snapshot, prev_metrics):
     return metrics
 
 def create_depth_chart(snapshot_df):
-    """Creates a cumulative market depth chart for a single snapshot."""
     bids = snapshot_df[snapshot_df['Type'] == 'BUY'].sort_values('Price', ascending=False)
     asks = snapshot_df[snapshot_df['Type'] == 'SELL'].sort_values('Price', ascending=True)
     bids['Accumulated'] = bids['Volume'].cumsum()
@@ -157,7 +171,6 @@ if st.session_state.live_mode_on:
         st.rerun()
     pause_status = "PAUSED" if st.session_state.is_paused else "RUNNING"
     st.sidebar.caption(f"Status: {pause_status}")
-
 st.sidebar.header("2. Chart Controls")
 bin_size = st.sidebar.number_input("Set Price Bin Size ($)", 0.01, 0.20, 0.05, 0.01, "%.2f")
 
@@ -188,21 +201,32 @@ else:
             last_update_time = depth_df_raw['datetime'].max()
             st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time.strftime('%H:%M:%S')})")
             
-            # --- MODIFIED: Dashboard is now in a collapsible expander ---
             with st.expander("Show Key Indicators", expanded=True):
                 latest_snapshot = depth_df_raw[depth_df_raw['datetime'] == last_update_time]
                 metrics = calculate_dashboard_metrics(latest_snapshot, st.session_state.prev_metrics)
                 st.session_state.prev_metrics = metrics
                 if metrics:
                     prev_metrics = metrics.get('prev_metrics', {})
+                    
+                    # --- NEW: Top row for traded volume ---
+                    vol_cols = st.columns(2)
+                    vol_cols[0].metric("Total Traded Volume", f"{metrics.get('Total Traded Volume', 0):,}")
+                    vol_cols[1].metric("Volume Change (Last Tick)", f"{metrics.get('Volume Change', 0):+,.0f}")
+                    st.markdown("<hr style='margin-top: 0; margin-bottom: 1em;'>", unsafe_allow_html=True)
+
                     cols = st.columns(3)
-                    cols[0].metric("Best Bid / Ask", f"${metrics['Best Bid']:.2f} / ${metrics['Best Ask']:.2f}", f"Spread: ${metrics['Spread']:.2f}")
+                    best_vol_buy_delta = metrics.get('Best Bid Volume', 0) - prev_metrics.get('Best Bid Volume', 0)
+                    best_vol_sell_delta = metrics.get('Best Ask Volume', 0) - prev_metrics.get('Best Ask Volume', 0)
+                    cols[0].markdown(f"""**Best Bid / Ask**<br>{'${:,.2f}'.format(metrics['Best Bid'])} / {'${:,.2f}'.format(metrics['Best Ask'])}<br><small>(Spread: {'${:,.2f}'.format(metrics['Spread'])})</small>""", unsafe_allow_html=True)
+                    cols[0].markdown(f"""**Best Vol (Buy/Sell)**<br>{metrics.get('Best Bid Volume', 0):,} / {metrics.get('Best Ask Volume', 0):,}<br><small>(Δ: {best_vol_buy_delta:+,.0f} / {best_vol_sell_delta:+,.0f})</small>""", unsafe_allow_html=True)
+                    
                     top_10_buy_delta = metrics['Top-10 Buy Volume'] - prev_metrics.get('Top-10 Buy Volume', 0)
                     top_10_sell_delta = metrics['Top-10 Sell Volume'] - prev_metrics.get('Top-10 Sell Volume', 0)
-                    cols[1].metric("Top 10 Depth (Buy/Sell)", f"{metrics['Top-10 Buy Volume']:,} / {metrics['Top-10 Sell Volume']:,}", f"Δ: {top_10_buy_delta:+,.0f} / {top_10_sell_delta:+,.0f}")
-                    cols[1].metric("Total Visible Depth (Buy/Sell)", f"{metrics['Total Buy Volume']:,} / {metrics['Total Sell Volume']:,}")
-                    cols[2].metric("Top 10 Imbalance", f"{metrics['Imbalance Ratio']:.1%}", "Buy-Side")
-                    cols[2].metric("Buy/Sell Delta", f"{metrics['Buy/Sell Delta']:+,.0f}")
+                    cols[1].markdown(f"""**Top 10 Depth (Buy/Sell)**<br>{metrics['Top-10 Buy Volume']:,} / {metrics['Top-10 Sell Volume']:,}<br><small>(Δ: {top_10_buy_delta:+,.0f} / {top_10_sell_delta:+,.0f})</small>""", unsafe_allow_html=True)
+                    cols[1].markdown(f"""**Total Visible Depth (Buy/Sell)**<br>{metrics['Total Buy Volume']:,} / {metrics['Total Sell Volume']:,}""", unsafe_allow_html=True)
+                    
+                    cols[2].markdown(f"""**Top 10 Imbalance**<br>{metrics['Imbalance Ratio']:.1%} <small>Buy-Side</small>""", unsafe_allow_html=True)
+                    cols[2].markdown(f"""**Buy/Sell Delta**<br>{metrics['Buy/Sell Delta']:+,.0f}""", unsafe_allow_html=True)
             
             st.markdown("---")
             trade_date = depth_df_raw['datetime'].iloc[0].date()
@@ -237,7 +261,7 @@ else:
                 fig.add_trace(go.Scatter(
                     x=price_df['datetime'], y=price_df['mid_point'],
                     mode='lines', name='Mid-Point', line=dict(color='rgba(0, 0, 0, 0.8)', width=2, dash='dash'),
-                    hovertemplate='<b>Time:</b> %{x|H:%M:%S}<br><b>Mid-Point:</b> $%{y:.3f}<extra></extra>'
+                    hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>Mid-Point:</b> $%{y:.3f}<extra></extra>'
                 ))
                 
                 fig.update_layout(height=650, title_text='Market Heatmap with Price Overlay', yaxis_title='Price Level')
