@@ -45,14 +45,15 @@ def parse_rows(batch_data):
     all_rows = []
     for snapshot in batch_data:
         dt = pd.to_datetime(snapshot.get('timestamp'), unit='ms')
+        last_price = snapshot.get('lastPrice')
         total_traded_volume = snapshot.get('totalTradedVolume')
         volume_change = snapshot.get('volumeChange')
         for order in snapshot.get('bids', []):
             all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size'),
-                             'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
+                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
         for order in snapshot.get('asks', []):
             all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size'),
-                             'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
+                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
     return all_rows
 
 def initial_load_with_progress(session_id):
@@ -120,23 +121,31 @@ def calculate_dashboard_metrics(current_snapshot, prev_metrics):
 
     # Extract new top-level metrics
     if 'totalTradedVolume' in current_snapshot.columns:
+        metrics['Last Price'] = current_snapshot['lastPrice'].iloc[0]
+        metrics['Last Price Change'] = metrics['Last Price'] - prev_metrics.get('Last Price', metrics['Last Price'])
         metrics['Total Traded Volume'] = current_snapshot['totalTradedVolume'].iloc[0]
         metrics['Volume Change'] = current_snapshot['volumeChange'].iloc[0]
 
     metrics['Best Bid'] = bids['Price'].max()
     metrics['Best Ask'] = asks['Price'].min()
     metrics['Spread'] = metrics['Best Ask'] - metrics['Best Bid']
+    
     metrics['Best Bid Volume'] = bids[bids['Price'] == metrics['Best Bid']]['Volume'].sum()
     metrics['Best Ask Volume'] = asks[asks['Price'] == metrics['Best Ask']]['Volume'].sum()
     top_10_bids = bids.nlargest(10, 'Price')
     top_10_asks = asks.nsmallest(10, 'Price')
+
     metrics['Top-10 Buy Volume'] = top_10_bids['Volume'].sum()
     metrics['Top-10 Sell Volume'] = top_10_asks['Volume'].sum()
+    
     metrics['Total Buy Volume'] = bids['Volume'].sum()
     metrics['Total Sell Volume'] = asks['Volume'].sum()
     metrics['Buy/Sell Delta'] = metrics['Total Buy Volume'] - metrics['Total Sell Volume']
+    metrics['Buy/Sell Delta Change'] = metrics['Buy/Sell Delta'] - prev_metrics.get('Buy/Sell Delta', metrics['Buy/Sell Delta'])
+    
     total_top_10_vol = metrics['Top-10 Buy Volume'] + metrics['Top-10 Sell Volume']
     metrics['Imbalance Ratio'] = (metrics['Top-10 Buy Volume'] / total_top_10_vol) if total_top_10_vol > 0 else 0.5
+    
     metrics['prev_metrics'] = prev_metrics
     return metrics
 
@@ -208,23 +217,32 @@ else:
                 if metrics:
                     prev_metrics = metrics.get('prev_metrics', {})
                     
-                    # --- NEW: Top row for traded volume ---
-                    vol_cols = st.columns(2)
-                    vol_cols[0].metric("Total Traded Volume", f"{metrics.get('Total Traded Volume', 0):,}")
-                    vol_cols[1].metric("Volume Change (Last Tick)", f"{metrics.get('Volume Change', 0):+,.0f}")
-                    st.markdown("<hr style='margin-top: 0; margin-bottom: 1em;'>", unsafe_allow_html=True)
+                    # --- Top row for traded volume and last price ---
+                    top_cols = st.columns(3)
+                    top_cols[0].metric("Last Price", f"${metrics.get('Last Price', 0):,.2f}", f"{metrics.get('Last Price Change', 0):.2f}")
+                    top_cols[1].metric("Total Traded Volume", f"{metrics.get('Total Traded Volume', 0):,}")
+                    top_cols[2].metric("Volume Change (Last Tick)", f"{metrics.get('Volume Change', 0):+,.0f}")
+                    st.markdown("<hr style='margin-top: -0.5em; margin-bottom: 1em;'>", unsafe_allow_html=True)
 
+                    # --- Main dashboard with compact markdown ---
                     cols = st.columns(3)
+
+                    # Pre-calculate deltas
                     best_vol_buy_delta = metrics.get('Best Bid Volume', 0) - prev_metrics.get('Best Bid Volume', 0)
                     best_vol_sell_delta = metrics.get('Best Ask Volume', 0) - prev_metrics.get('Best Ask Volume', 0)
+                    top_10_buy_delta = metrics['Top-10 Buy Volume'] - prev_metrics.get('Top-10 Buy Volume', 0)
+                    top_10_sell_delta = metrics['Top-10 Sell Volume'] - prev_metrics.get('Top-10 Sell Volume', 0)
+                    buy_sell_delta_change = metrics.get('Buy/Sell Delta Change', 0)
+
+                    # Column 1
                     cols[0].markdown(f"""**Best Bid / Ask**<br>{'${:,.2f}'.format(metrics['Best Bid'])} / {'${:,.2f}'.format(metrics['Best Ask'])}<br><small>(Spread: {'${:,.2f}'.format(metrics['Spread'])})</small>""", unsafe_allow_html=True)
                     cols[0].markdown(f"""**Best Vol (Buy/Sell)**<br>{metrics.get('Best Bid Volume', 0):,} / {metrics.get('Best Ask Volume', 0):,}<br><small>(Δ: {best_vol_buy_delta:+,.0f} / {best_vol_sell_delta:+,.0f})</small>""", unsafe_allow_html=True)
                     
-                    top_10_buy_delta = metrics['Top-10 Buy Volume'] - prev_metrics.get('Top-10 Buy Volume', 0)
-                    top_10_sell_delta = metrics['Top-10 Sell Volume'] - prev_metrics.get('Top-10 Sell Volume', 0)
+                    # Column 2
                     cols[1].markdown(f"""**Top 10 Depth (Buy/Sell)**<br>{metrics['Top-10 Buy Volume']:,} / {metrics['Top-10 Sell Volume']:,}<br><small>(Δ: {top_10_buy_delta:+,.0f} / {top_10_sell_delta:+,.0f})</small>""", unsafe_allow_html=True)
                     cols[1].markdown(f"""**Total Visible Depth (Buy/Sell)**<br>{metrics['Total Buy Volume']:,} / {metrics['Total Sell Volume']:,}""", unsafe_allow_html=True)
-                    
+
+                    # Column 3
                     cols[2].markdown(f"""**Top 10 Imbalance**<br>{metrics['Imbalance Ratio']:.1%} <small>Buy-Side</small>""", unsafe_allow_html=True)
                     cols[2].markdown(f"""**Buy/Sell Delta**<br>{metrics['Buy/Sell Delta']:+,.0f}""", unsafe_allow_html=True)
             
@@ -234,7 +252,7 @@ else:
             SESSION_START = pd.to_datetime(f"{trade_date} 10:00:00").tz_localize('Australia/Melbourne')
             SESSION_END = pd.to_datetime(f"{trade_date} 16:00:00").tz_localize('Australia/Melbourne')
             
-            depth_df = depth_df_raw[(depth_df_raw['datetime'] >= SESSION_START) & (depth_df_raw['datetime'] < SESSION_END)]
+            depth_df = depth_df_raw[(depth_df_raw['datetime'] >= SESSION_START) & (depth_df_raw['datetime'] < SESSION_END)].copy()
             price_df = price_df[(price_df['datetime'] >= SESSION_START) & (price_df['datetime'] < SESSION_END)]
             
             if depth_df.empty or price_df.empty:
