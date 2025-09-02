@@ -251,12 +251,21 @@ else:
             
             st.markdown("---")
             trade_date = depth_df_raw['datetime'].iloc[0].date()
+            
+            # --- Prepare data for plotting ---
             price_df = calculate_mid_point(depth_df_raw)
+            # Create a dataframe for VWAP by getting the first value for each timestamp
+            vwap_df = depth_df_raw.groupby('datetime')['VWAP'].first().reset_index()
+
+            # --- Define the main trading session window ---
             SESSION_START = pd.to_datetime(f"{trade_date} 10:00:00").tz_localize('Australia/Melbourne')
             SESSION_END = pd.to_datetime(f"{trade_date} 16:00:00").tz_localize('Australia/Melbourne')
             
+            # Filter the main depth data for the heatmap
             depth_df = depth_df_raw[(depth_df_raw['datetime'] >= SESSION_START) & (depth_df_raw['datetime'] < SESSION_END)].copy()
+            
             price_df = price_df[(price_df['datetime'] >= SESSION_START) & (price_df['datetime'] < SESSION_END)]
+            vwap_df = vwap_df[(vwap_df['datetime'] >= SESSION_START) & (vwap_df['datetime'] < SESSION_END)]
             
             if depth_df.empty or price_df.empty:
                 st.warning("Waiting for data within the main trading session (10:00 AM - 4:00 PM)...")
