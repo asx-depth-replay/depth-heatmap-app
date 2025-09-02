@@ -48,12 +48,13 @@ def parse_rows(batch_data):
         last_price = snapshot.get('lastPrice')
         total_traded_volume = snapshot.get('totalTradedVolume')
         volume_change = snapshot.get('volumeChange')
+        vwap = snapshot.get('VWAP')
         for order in snapshot.get('bids', []):
             all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size'),
-                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
+                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change, 'VWAP': vwap})
         for order in snapshot.get('asks', []):
             all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size'),
-                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change})
+                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change, 'VWAP': vwap})
     return all_rows
 
 def initial_load_with_progress(session_id):
@@ -120,11 +121,12 @@ def calculate_dashboard_metrics(current_snapshot, prev_metrics):
     if bids.empty or asks.empty: return prev_metrics
 
     # Extract new top-level metrics
-    if 'totalTradedVolume' in current_snapshot.columns:
+    if 'lastPrice' in current_snapshot.columns and pd.notna(current_snapshot['lastPrice'].iloc[0]):
         metrics['Last Price'] = current_snapshot['lastPrice'].iloc[0]
         metrics['Last Price Change'] = metrics['Last Price'] - prev_metrics.get('Last Price', metrics['Last Price'])
         metrics['Total Traded Volume'] = current_snapshot['totalTradedVolume'].iloc[0]
         metrics['Volume Change'] = current_snapshot['volumeChange'].iloc[0]
+        metrics['VWAP'] = current_snapshot['VWAP'].iloc[0]
 
     metrics['Best Bid'] = bids['Price'].max()
     metrics['Best Ask'] = asks['Price'].min()
@@ -217,11 +219,12 @@ else:
                 if metrics:
                     prev_metrics = metrics.get('prev_metrics', {})
                     
-                    # --- Top row for traded volume and last price ---
-                    top_cols = st.columns(3)
+                    # --- Top row for key indicators ---
+                    top_cols = st.columns(4)
                     top_cols[0].metric("Last Price", f"${metrics.get('Last Price', 0):,.2f}", f"{metrics.get('Last Price Change', 0):.2f}")
-                    top_cols[1].metric("Total Traded Volume", f"{metrics.get('Total Traded Volume', 0):,}")
-                    top_cols[2].metric("Volume Change (Last Tick)", f"{metrics.get('Volume Change', 0):+,.0f}")
+                    top_cols[1].metric("VWAP", f"${metrics.get('VWAP', 0):,.4f}")
+                    top_cols[2].metric("Total Traded Volume", f"{metrics.get('Total Traded Volume', 0):,}")
+                    top_cols[3].metric("Volume Change (Last Tick)", f"{metrics.get('Volume Change', 0):+,.0f}")
                     st.markdown("<hr style='margin-top: -0.5em; margin-bottom: 1em;'>", unsafe_allow_html=True)
 
                     # --- Main dashboard with compact markdown ---
@@ -278,8 +281,17 @@ else:
                 
                 fig.add_trace(go.Scatter(
                     x=price_df['datetime'], y=price_df['mid_point'],
-                    mode='lines', name='Mid-Point', line=dict(color='rgba(0, 0, 0, 0.8)', width=2, dash='dash'),
+                    mode='lines', name='Mid-Point',
+                    line=dict(color='rgba(0, 0, 0, 0.8)', width=2, dash='dash'),
                     hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>Mid-Point:</b> $%{y:.3f}<extra></extra>'
+                ))
+
+                # --- NEW: Add the VWAP trace to the chart ---
+                fig.add_trace(go.Scatter(
+                    x=vwap_df['datetime'], y=vwap_df['VWAP'],
+                    mode='lines', name='VWAP',
+                    line=dict(color='rgba(0, 0, 0, 1)', width=2, dash='solid'),
+                    hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>VWAP:</b> $%{y:.4f}<extra></extra>'
                 ))
                 
                 fig.update_layout(height=650, title_text='Market Heatmap with Price Overlay', yaxis_title='Price Level')
