@@ -123,7 +123,6 @@ def calculate_dashboard_metrics(current_snapshot, prev_metrics):
     # Extract new top-level metrics
     if 'lastPrice' in current_snapshot.columns and pd.notna(current_snapshot['lastPrice'].iloc[0]):
         metrics['Last Price'] = current_snapshot['lastPrice'].iloc[0]
-        metrics['Last Price Change'] = metrics['Last Price'] - prev_metrics.get('Last Price', metrics['Last Price'])
         metrics['Total Traded Volume'] = current_snapshot['totalTradedVolume'].iloc[0]
         metrics['Volume Change'] = current_snapshot['volumeChange'].iloc[0]
         metrics['VWAP'] = current_snapshot['VWAP'].iloc[0]
@@ -134,21 +133,27 @@ def calculate_dashboard_metrics(current_snapshot, prev_metrics):
     
     metrics['Best Bid Volume'] = bids[bids['Price'] == metrics['Best Bid']]['Volume'].sum()
     metrics['Best Ask Volume'] = asks[asks['Price'] == metrics['Best Ask']]['Volume'].sum()
+    
     top_10_bids = bids.nlargest(10, 'Price')
     top_10_asks = asks.nsmallest(10, 'Price')
-
     metrics['Top-10 Buy Volume'] = top_10_bids['Volume'].sum()
     metrics['Top-10 Sell Volume'] = top_10_asks['Volume'].sum()
     
     metrics['Total Buy Volume'] = bids['Volume'].sum()
     metrics['Total Sell Volume'] = asks['Volume'].sum()
     metrics['Buy/Sell Delta'] = metrics['Total Buy Volume'] - metrics['Total Sell Volume']
-    metrics['Buy/Sell Delta Change'] = metrics['Buy/Sell Delta'] - prev_metrics.get('Buy/Sell Delta', metrics['Buy/Sell Delta'])
     
     total_top_10_vol = metrics['Top-10 Buy Volume'] + metrics['Top-10 Sell Volume']
     metrics['Imbalance Ratio'] = (metrics['Top-10 Buy Volume'] / total_top_10_vol) if total_top_10_vol > 0 else 0.5
     
-    metrics['prev_metrics'] = prev_metrics
+    # --- CENTRALIZED DELTA CALCULATIONS ---
+    metrics['Last Price Change'] = metrics.get('Last Price', 0) - prev_metrics.get('Last Price', metrics.get('Last Price', 0))
+    metrics['Best Bid Volume Change'] = metrics.get('Best Bid Volume', 0) - prev_metrics.get('Best Bid Volume', 0)
+    metrics['Best Ask Volume Change'] = metrics.get('Best Ask Volume', 0) - prev_metrics.get('Best Ask Volume', 0)
+    metrics['Top-10 Buy Volume Change'] = metrics.get('Top-10 Buy Volume', 0) - prev_metrics.get('Top-10 Buy Volume', 0)
+    metrics['Top-10 Sell Volume Change'] = metrics.get('Top-10 Sell Volume', 0) - prev_metrics.get('Top-10 Sell Volume', 0)
+    metrics['Buy/Sell Delta Change'] = metrics.get('Buy/Sell Delta', 0) - prev_metrics.get('Buy/Sell Delta', 0)
+    
     return metrics
 
 def create_depth_chart(snapshot_df):
@@ -214,11 +219,12 @@ else:
             
             with st.expander("Show Key Indicators", expanded=True):
                 latest_snapshot = depth_df_raw[depth_df_raw['datetime'] == last_update_time]
+
+                # The previous metrics are passed in, and the new ones are calculated
                 metrics = calculate_dashboard_metrics(latest_snapshot, st.session_state.prev_metrics)
-                st.session_state.prev_metrics = metrics
+                st.session_state.prev_metrics = metrics # Store the new metrics for the next run
+
                 if metrics:
-                    prev_metrics = metrics.get('prev_metrics', {})
-                    
                     # --- Top row for key indicators ---
                     top_cols = st.columns(4)
                     top_cols[0].metric("Last Price", f"${metrics.get('Last Price', 0):,.2f}", f"{metrics.get('Last Price Change', 0):.2f}")
@@ -227,27 +233,20 @@ else:
                     top_cols[3].metric("Volume Change (Last Tick)", f"{metrics.get('Volume Change', 0):+,.0f}")
                     st.markdown("<hr style='margin-top: -0.5em; margin-bottom: 1em;'>", unsafe_allow_html=True)
 
-                    # --- Main dashboard with compact markdown ---
+                    # --- Main dashboard with compact markdown (NOW CLEANER) ---
                     cols = st.columns(3)
 
-                    # Pre-calculate deltas
-                    best_vol_buy_delta = metrics.get('Best Bid Volume', 0) - prev_metrics.get('Best Bid Volume', 0)
-                    best_vol_sell_delta = metrics.get('Best Ask Volume', 0) - prev_metrics.get('Best Ask Volume', 0)
-                    top_10_buy_delta = metrics['Top-10 Buy Volume'] - prev_metrics.get('Top-10 Buy Volume', 0)
-                    top_10_sell_delta = metrics['Top-10 Sell Volume'] - prev_metrics.get('Top-10 Sell Volume', 0)
-                    buy_sell_delta_change = metrics.get('Buy/Sell Delta Change', 0)
-
                     # Column 1
-                    cols[0].markdown(f"""**Best Bid / Ask**<br>{'${:,.2f}'.format(metrics['Best Bid'])} / {'${:,.2f}'.format(metrics['Best Ask'])}<br><small>(Spread: {'${:,.2f}'.format(metrics['Spread'])})</small>""", unsafe_allow_html=True)
-                    cols[0].markdown(f"""**Best Vol (Buy/Sell)**<br>{metrics.get('Best Bid Volume', 0):,} / {metrics.get('Best Ask Volume', 0):,}<br><small>(Δ: {best_vol_buy_delta:+,.0f} / {best_vol_sell_delta:+,.0f})</small>""", unsafe_allow_html=True)
+                    cols[0].markdown(f"""**Best Bid / Ask**<br>{'${:,.2f}'.format(metrics.get('Best Bid', 0))} / {'${:,.2f}'.format(metrics.get('Best Ask', 0))}<br><small>(Spread: {'${:,.2f}'.format(metrics.get('Spread',0))})</small>""", unsafe_allow_html=True)
+                    cols[0].markdown(f"""**Best Vol (Buy/Sell)**<br>{metrics.get('Best Bid Volume', 0):,} / {metrics.get('Best Ask Volume', 0):,}<br><small>(Δ: {metrics.get('Best Bid Volume Change', 0):+,.0f} / {metrics.get('Best Ask Volume Change', 0):+,.0f})</small>""", unsafe_allow_html=True)
                     
                     # Column 2
-                    cols[1].markdown(f"""**Top 10 Depth (Buy/Sell)**<br>{metrics['Top-10 Buy Volume']:,} / {metrics['Top-10 Sell Volume']:,}<br><small>(Δ: {top_10_buy_delta:+,.0f} / {top_10_sell_delta:+,.0f})</small>""", unsafe_allow_html=True)
-                    cols[1].markdown(f"""**Total Visible Depth (Buy/Sell)**<br>{metrics['Total Buy Volume']:,} / {metrics['Total Sell Volume']:,}""", unsafe_allow_html=True)
+                    cols[1].markdown(f"""**Top 10 Depth (Buy/Sell)**<br>{metrics.get('Top-10 Buy Volume', 0):,} / {metrics.get('Top-10 Sell Volume', 0):,}<br><small>(Δ: {metrics.get('Top-10 Buy Volume Change', 0):+,.0f} / {metrics.get('Top-10 Sell Volume Change', 0):+,.0f})</small>""", unsafe_allow_html=True)
+                    cols[1].markdown(f"""**Total Visible Depth (Buy/Sell)**<br>{metrics.get('Total Buy Volume', 0):,} / {metrics.get('Total Sell Volume', 0):,}""", unsafe_allow_html=True)
 
                     # Column 3
-                    cols[2].markdown(f"""**Top 10 Imbalance**<br>{metrics['Imbalance Ratio']:.1%} <small>Buy-Side</small>""", unsafe_allow_html=True)
-                    cols[2].markdown(f"""**Buy/Sell Delta**<br>{metrics['Buy/Sell Delta']:+,.0f}""", unsafe_allow_html=True)
+                    cols[2].markdown(f"""**Top 10 Imbalance**<br>{metrics.get('Imbalance Ratio', 0):.1%} <small>Buy-Side</small>""", unsafe_allow_html=True)
+                    cols[2].markdown(f"""**Buy/Sell Delta**<br>{metrics.get('Buy/Sell Delta', 0):+,.0f}""", unsafe_allow_html=True)
             
             st.markdown("---")
             trade_date = depth_df_raw['datetime'].iloc[0].date()
