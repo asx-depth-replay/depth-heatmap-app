@@ -15,11 +15,11 @@ st.title("📈 Live Market Heatmap")
 st.markdown("Click the button in the sidebar to start streaming today's live session.")
 
 # --- 3. API & Data Functions ---
-BATCH_SIZE = 100
 API_URLS = {
     'LIST_SESSIONS': 'https://list-sessions-897370608024.australia-southeast1.run.app',
-    'GET_SESSION_DETAILS': 'https://get-session-details-897370608024.australia-southeast1.run.app',
-    'GET_SNAPSHOTS': 'https://get-snapshots-897370608024.australia-southeast1.run.app'
+    # --- Using our two new, efficient APIs ---
+    'GET_SNAPSHOTS_SINCE': 'https://get-snapshots-since-897370608024.australia-southeast1.run.app',
+    'GET_HEATMAP_DATA': 'https://get-heatmap-data-897370608024.australia-southeast1.run.app'
 }
 
 @st.cache_data(ttl=300)
@@ -33,13 +33,6 @@ def fetch_available_sessions():
         st.error(f"API Error: Could not fetch sessions. {e}")
         return []
 
-def get_snapshots(session_id, timestamps):
-    if not timestamps: return []
-    timestamps_str = ",".join(map(str, timestamps))
-    snapshot_url = f"{API_URLS['GET_SNAPSHOTS']}?id={session_id}&timestamps={timestamps_str}"
-    response = requests.get(snapshot_url)
-    return response.json() if response.ok else []
-
 def parse_rows(batch_data):
     """Helper function to parse JSON data, including new volume metrics."""
     all_rows = []
@@ -50,68 +43,62 @@ def parse_rows(batch_data):
         volume_change = snapshot.get('volumeChange')
         vwap = snapshot.get('VWAP')
         for order in snapshot.get('bids', []):
-            all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size'),
-                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change, 'VWAP': vwap})
+            all_rows.append({'datetime': dt, 'Type': 'BUY', 'Price': order.get('price'), 'Volume': order.get('size'), 'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change, 'VWAP': vwap})
         for order in snapshot.get('asks', []):
-            all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size'),
-                             'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change, 'VWAP': vwap})
+            all_rows.append({'datetime': dt, 'Type': 'SELL', 'Price': order.get('price'), 'Volume': order.get('size'), 'lastPrice': last_price, 'totalTradedVolume': total_traded_volume, 'volumeChange': volume_change, 'VWAP': vwap})
     return all_rows
 
+# --- REWRITTEN to be more efficient using the new API ---
 def initial_load_with_progress(session_id):
+    """Performs an efficient initial load of all raw data using the get-snapshots-since API."""
+    st.info("Performing initial data load for metrics dashboard...")
     try:
-        details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
-        details_response = requests.get(details_url)
-        details_response.raise_for_status()
-        timestamps = details_response.json().get('timestamps', [])
-        if not timestamps:
+        # Make one efficient call to get all snapshots for the day by using since=0
+        url = f"{API_URLS['GET_SNAPSHOTS_SINCE']}?id={session_id}&since=0"
+        response = requests.get(url, timeout=45) # Use a longer timeout for the potentially large initial load
+        response.raise_for_status()
+        all_snapshots = response.json()
+        
+        if not all_snapshots:
             st.warning("Waiting for the first data snapshot...")
             return
 
-        total_timestamps = len(timestamps)
-        progress_bar = st.progress(0, text=f"Catching up with live session (0/{total_timestamps})...")
-        all_rows = []
-        for i in range(0, total_timestamps, BATCH_SIZE):
-            batch_timestamps = timestamps[i:i + BATCH_SIZE]
-            batch_data = get_snapshots(session_id, batch_timestamps)
-            all_rows.extend(parse_rows(batch_data))
-            percent_complete = min((i + BATCH_SIZE) / total_timestamps, 1.0)
-            progress_text = f"Catching up ({min(i + BATCH_SIZE, total_timestamps)}/{total_timestamps})..."
-            progress_bar.progress(percent_complete, text=progress_text)
-        progress_bar.empty()
-        
+        all_rows = parse_rows(all_snapshots)
         if all_rows:
             df = pd.DataFrame(all_rows)
             df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
             st.session_state.depth_df_raw = df
-            st.session_state.last_timestamp = max(timestamps)
+            # Set the last timestamp from the most recent snapshot received
+            st.session_state.last_timestamp = max(s['timestamp'] for s in all_snapshots)
     except requests.exceptions.RequestException as e:
         st.error(f"API Error during initial load: {e}")
 
+# --- REWRITTEN to be more efficient using the new API ---
 def incremental_update(session_id):
+    """Performs an efficient incremental update for live metrics using a single API call."""
     try:
-        details_url = f"{API_URLS['GET_SESSION_DETAILS']}?id={session_id}"
-        details_response = requests.get(details_url)
-        details_response.raise_for_status()
-        all_timestamps = details_response.json().get('timestamps', [])
-        
         last_timestamp = st.session_state.get('last_timestamp', 0)
-        new_timestamps = [ts for ts in all_timestamps if ts > last_timestamp]
-        if new_timestamps:
-            new_rows = parse_rows(get_snapshots(session_id, new_timestamps))
+        
+        # Make one efficient call to get only new snapshots
+        url = f"{API_URLS['GET_SNAPSHOTS_SINCE']}?id={session_id}&since={last_timestamp}"
+        response = requests.get(url)
+        response.raise_for_status()
+        new_snapshots = response.json()
+
+        if new_snapshots:
+            new_rows = parse_rows(new_snapshots)
             if new_rows:
                 new_df = pd.DataFrame(new_rows)
                 new_df['datetime'] = new_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Australia/Melbourne')
+                # Append new data to the existing DataFrame
                 st.session_state.depth_df_raw = pd.concat([st.session_state.depth_df_raw, new_df]).drop_duplicates()
-                st.session_state.last_timestamp = max(new_timestamps)
+                # Update the last timestamp to the newest one received
+                st.session_state.last_timestamp = max(s['timestamp'] for s in new_snapshots)
     except requests.exceptions.RequestException:
+        # Fail silently on a refresh error, as the app will just try again in 5 seconds
         pass
 
-def calculate_mid_point(df):
-    bids = df[df['Type'] == 'BUY'].groupby('datetime')['Price'].max().rename('best_bid')
-    asks = df[df['Type'] == 'SELL'].groupby('datetime')['Price'].min().rename('best_ask')
-    merged_df = pd.concat([bids, asks], axis=1).dropna()
-    merged_df['mid_point'] = (merged_df['best_bid'] + merged_df['best_ask']) / 2
-    return merged_df.reset_index()
+# --- METRICS CALCULATION ---
 
 def calculate_dashboard_metrics(current_snapshot, prev_metrics):
     """Calculates a full dashboard of metrics from the latest snapshot."""
@@ -156,6 +143,20 @@ def calculate_dashboard_metrics(current_snapshot, prev_metrics):
     
     return metrics
 
+# --- NEW FUNCTION TO FETCH PRE-CALCULATED HEATMAP CHART DATA ---
+@st.cache_data(ttl=5) # Cache the result for 5s to avoid re-fetching on simple UI interactions
+def fetch_chart_data(session_id, bin_size):
+    """Fetches pre-calculated data for the heatmap and overlays from the server."""
+    if not API_URLS.get('GET_HEATMAP_DATA') or '<' in API_URLS['GET_HEATMAP_DATA']:
+        return None
+    try:
+        url = f"{API_URLS['GET_HEATMAP_DATA']}?id={session_id}&bin_size={bin_size}"
+        response = requests.get(url, timeout=45) # Use a long timeout for the heavy calculation
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException:
+        return None
+
 def create_depth_chart(snapshot_df):
     bids = snapshot_df[snapshot_df['Type'] == 'BUY'].sort_values('Price', ascending=False)
     asks = snapshot_df[snapshot_df['Type'] == 'SELL'].sort_values('Price', ascending=True)
@@ -190,10 +191,13 @@ if st.session_state.live_mode_on:
 st.sidebar.header("2. Chart Controls")
 bin_size = st.sidebar.number_input("Set Price Bin Size ($)", 0.01, 0.20, 0.05, 0.01, "%.2f")
 
-# --- 5. Main Application Logic ---
+# --- 5. Main Application Logic (NOW FULLY OPTIMIZED) ---
 if not st.session_state.live_mode_on:
     st.info("👋 Welcome! Click 'Start Live Session' in the sidebar to begin.")
 else:
+    if not st.session_state.is_paused:
+        st_autorefresh(interval=5000, key="data_refresher") # 5-second refresh interval
+
     sessions = fetch_available_sessions()
     today_str = datetime.now(pytz.timezone('Australia/Melbourne')).strftime('%Y%m%d')
     todays_session_id = next((s['id'] for s in sessions if s.get('id', '').startswith(today_str)), None)
@@ -201,19 +205,21 @@ else:
     if not todays_session_id:
         st.error(f"Could not find a live session for today ({today_str}). Please check the API.")
     else:
+        # --- DATA FETCHING (HYBRID AND EFFICIENT) ---
         is_initial_load = st.session_state.get('depth_df_raw') is None
         if is_initial_load:
             initial_load_with_progress(todays_session_id)
         if not st.session_state.get('is_paused', False) and not is_initial_load:
-            st_autorefresh(interval=5000, key="data_refresher")
             incremental_update(todays_session_id)
+        
+        chart_data = fetch_chart_data(todays_session_id, bin_size)
+
+        # --- DISPLAY LOGIC ---
         
         depth_df_raw = st.session_state.get('depth_df_raw')
         if depth_df_raw is None or depth_df_raw.empty:
             st.warning("Waiting for session data...")
         else:
-            depth_df_raw['Price'] = pd.to_numeric(depth_df_raw['Price'])
-            depth_df_raw['Volume'] = pd.to_numeric(depth_df_raw['Volume'])
             last_update_time = depth_df_raw['datetime'].max()
             st.header(f"Session Liquidity Heatmap (Live - Last Update: {last_update_time.strftime('%H:%M:%S')})")
             
@@ -249,66 +255,25 @@ else:
                     cols[2].markdown(f"""**Buy/Sell Delta**<br>{metrics.get('Buy/Sell Delta', 0):+,.0f}""", unsafe_allow_html=True)
             
             st.markdown("---")
-            trade_date = depth_df_raw['datetime'].iloc[0].date()
-            
-            # --- Prepare data for plotting ---
-            price_df = calculate_mid_point(depth_df_raw)
-            # Create a dataframe for VWAP by getting the first value for each timestamp
-            vwap_df = depth_df_raw.groupby('datetime')['VWAP'].first().reset_index()
-
-            # --- Define the main trading session window ---
-            SESSION_START = pd.to_datetime(f"{trade_date} 10:00:00").tz_localize('Australia/Melbourne')
-            SESSION_END = pd.to_datetime(f"{trade_date} 16:00:00").tz_localize('Australia/Melbourne')
-            
-            # Filter the main depth data for the heatmap
-            depth_df = depth_df_raw[(depth_df_raw['datetime'] >= SESSION_START) & (depth_df_raw['datetime'] < SESSION_END)].copy()
-            
-            price_df = price_df[(price_df['datetime'] >= SESSION_START) & (price_df['datetime'] < SESSION_END)]
-            vwap_df = vwap_df[(vwap_df['datetime'] >= SESSION_START) & (vwap_df['datetime'] < SESSION_END)]
-            
-            if depth_df.empty or price_df.empty:
-                st.warning("Waiting for data within the main trading session (10:00 AM - 4:00 PM)...")
+            # Main Chart (now uses pre-calculated data from the new API)
+            if not chart_data:
+                st.warning("Generating heatmap data on the server...")
             else:
-                depth_df['SignedVolume'] = np.where(depth_df['Type'] == 'BUY', depth_df['Volume'], -depth_df['Volume'])
-                min_price = price_df['mid_point'].min() - 0.50
-                max_price = price_df['mid_point'].max() + 0.50
-                price_bins = np.arange(np.floor(min_price), np.ceil(max_price) + bin_size, bin_size)
-                
-                depth_df['price_bin'] = pd.cut(depth_df['Price'], bins=price_bins, right=False)
-                binned_heatmap = depth_df.pivot_table(index='price_bin', columns='datetime', values='SignedVolume', aggfunc='sum', observed=True).fillna(0)
-                
+                heatmap = chart_data['heatmap']
+                overlays = chart_data['overlays']
                 fig = go.Figure()
-                non_zero_values = binned_heatmap.values[binned_heatmap.values != 0]
-                clip_level = np.percentile(np.abs(non_zero_values), 95) if non_zero_values.size > 0 else 1
-                
-                fig.add_trace(go.Heatmap(
-                    x=binned_heatmap.columns, y=[interval.left for interval in binned_heatmap.index], z=binned_heatmap.values,
-                    colorscale='RdBu', zmid=0, zmin=-clip_level, zmax=clip_level,
-                    name='Net Liquidity', hoverinfo='none', colorbar=dict(x=1.0, title='Net Liquidity')
-                ))
-                
-                fig.add_trace(go.Scatter(
-                    x=price_df['datetime'], y=price_df['mid_point'],
-                    mode='lines', name='Mid-Point',
-                    line=dict(color='rgba(0, 0, 0, 0.8)', width=2, dash='dash'),
-                    hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>Mid-Point:</b> $%{y:.3f}<extra></extra>'
-                ))
-
-                # --- NEW: Add the VWAP trace to the chart ---
-                fig.add_trace(go.Scatter(
-                    x=vwap_df['datetime'], y=vwap_df['VWAP'],
-                    mode='lines', name='VWAP',
-                    line=dict(color='rgba(0, 0, 0, 1)', width=2, dash='solid'),
-                    hovertemplate='<b>Time:</b> %{x|%H:%M:%S}<br><b>VWAP:</b> $%{y:.4f}<extra></extra>'
-                ))
-                
+                fig.add_trace(go.Heatmap(x=heatmap['x'], y=heatmap['y'], z=heatmap['z'], colorscale='RdBu', zmid=0, name='Net Liquidity', hoverinfo='none', colorbar=dict(x=1.0, title='Net Liquidity')))
+                fig.add_trace(go.Scatter(x=overlays['mid_point']['x'], y=overlays['mid_point']['y'], mode='lines', name='Mid-Point', line=dict(color='rgba(0, 0, 0, 0.8)', width=2, dash='dash')))
+                fig.add_trace(go.Scatter(x=overlays['vwap']['x'], y=overlays['vwap']['y'], mode='lines', name='VWAP', line=dict(color='rgba(0, 0, 0, 1)', width=2, dash='solid')))
                 fig.update_layout(height=650, title_text='Market Heatmap with Price Overlay', yaxis_title='Price Level')
                 st.plotly_chart(fig, use_container_width=True)
 
-                with st.expander("Show Market Depth Chart"):
-                    current_snapshot_df = depth_df_raw[depth_df_raw['datetime'] == last_update_time]
-                    if not current_snapshot_df.empty:
-                        depth_fig = create_depth_chart(current_snapshot_df)
-                        st.plotly_chart(depth_fig, use_container_width=True)
-                    else:
-                        st.write("No snapshot data to display.")
+            # --- RE-INTRODUCED DEPTH CHART DISPLAY LOGIC ---
+            with st.expander("Show Market Depth Chart"):
+                current_snapshot_df = depth_df_raw[depth_df_raw['datetime'] == last_update_time]
+                if not current_snapshot_df.empty:
+                    depth_fig = create_depth_chart(current_snapshot_df)
+                    st.plotly_chart(depth_fig, use_container_width=True)
+                else:
+                    st.write("No snapshot data available to display depth chart.")
+
