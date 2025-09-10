@@ -188,7 +188,7 @@ if st.session_state.live_mode_on:
     st.sidebar.caption(f"Status: {'PAUSED' if st.session_state.is_paused else 'RUNNING'}")
 st.sidebar.header("2. Chart Controls")
 # --- CHANGE 3: IMPROVING THE BIN SIZE WIDGET FOR BETTER UX ---
-bin_size_options = [0.01, 0.02, 0.05, 0.10, 0.20]
+bin_size_options = [0.01, 0.02, 0.03, 0.04, 0.05, 0.10, 0.20]
 bin_size = st.sidebar.select_slider(
     "Set Price Bin Size ($)",
     options=bin_size_options,
@@ -200,7 +200,7 @@ if not st.session_state.live_mode_on:
     st.info("👋 Welcome! Click 'Start Live Session' in the sidebar to begin.")
 else:
     sessions = fetch_available_sessions()
-    today_str = datetime.now(pytz.timezone('Australia/Melbourne')).strftime('%Ym%d')
+    today_str = datetime.now(pytz.timezone('Australia/Melbourne')).strftime('%Y%m%d')
     todays_session_id = next((s['id'] for s in sessions if s.get('id', '').startswith(today_str)), None)
     
     if not todays_session_id:
